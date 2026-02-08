@@ -1,0 +1,12 @@
+# RF Rectifier Simulation - Python Dependencies
+# Install with: pip install -r requirements.txt
+#
+# Note: ngspice must be installed separately as a system package:
+#   Ubuntu/Debian: sudo apt install ngspice
+#   macOS:         brew install ngspice
+#   Windows:       Download from https://ngspice.sourceforge.io/download.html
+#                  Add ngspice to PATH after installation
+
+numpy==2.4.2
+matplotlib==3.10.8
+PySpice==1.5

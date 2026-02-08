@@ -1,0 +1,73 @@
+* =============================================================================
+* RF Schottky Diode SPICE Model Library
+* =============================================================================
+* This library contains diode models for RF energy harvesting simulations.
+* Add your own models or modify parameters as needed.
+*
+* Key Parameters for RF Schottky Diodes:
+*   IS  = Saturation current (lower = lower leakage, but higher Vf)
+*   N   = Ideality factor (1.0-1.2 typical for Schottky)
+*   RS  = Series resistance (lower = better RF performance)
+*   CJO = Zero-bias junction capacitance (critical for RF!)
+*   BV  = Breakdown voltage
+*   IBV = Current at breakdown
+*   VJ  = Junction potential
+*   M   = Grading coefficient
+*   TT  = Transit time
+*
+* =============================================================================
+
+* -----------------------------------------------------------------------------
+* DEFAULT_SCHOTTKY - Generic RF Schottky Diode
+* -----------------------------------------------------------------------------
+* A reasonable default model for simulation, based on typical RF Schottky
+* characteristics. Good starting point before using specific part models.
+* Low forward voltage drop (~0.15-0.25V at low current)
+* Low junction capacitance (~0.18 pF), Fast switching
+*
+.MODEL DEFAULT_SCHOTTKY D (IS=5e-8 N=1.05 RS=6 CJO=0.18e-12 VJ=0.35 M=0.5 BV=4 IBV=1e-5 TT=10e-12 EG=0.69)
+
+* -----------------------------------------------------------------------------
+* SMS7630 - Skyworks Low Barrier Schottky (Popular for RF Harvesting)
+* -----------------------------------------------------------------------------
+* Skyworks SMS7630 series - excellent for low-power RF rectification
+* Very low barrier height, ideal for harvesting weak RF signals
+* IS=5uA gives very low turn-on voltage
+*
+.MODEL SMS7630 D (IS=5e-6 N=1.05 RS=20 CJO=0.14e-12 VJ=0.34 M=0.4 BV=2 IBV=1e-4 TT=10e-12 EG=0.69)
+
+* -----------------------------------------------------------------------------
+* HSMS2850 - Avago/Broadcom Low Barrier Schottky
+* -----------------------------------------------------------------------------
+* HSMS-285x series - another popular choice for RF energy harvesting
+* Good for frequencies up to 6 GHz
+*
+.MODEL HSMS2850 D (IS=3e-6 N=1.06 RS=25 CJO=0.18e-12 VJ=0.35 M=0.5 BV=3.8 IBV=1e-4 TT=5e-12 EG=0.69)
+
+* -----------------------------------------------------------------------------
+* HSMS2860 - Avago/Broadcom Medium Barrier Schottky
+* -----------------------------------------------------------------------------
+* HSMS-286x series - higher breakdown voltage variant
+* Better for higher power levels, slightly higher Vf
+*
+.MODEL HSMS2860 D (IS=5e-8 N=1.08 RS=6 CJO=0.18e-12 VJ=0.65 M=0.5 BV=7 IBV=1e-4 TT=5e-12 EG=0.69)
+
+* -----------------------------------------------------------------------------
+* BAT15 - Infineon Silicon Schottky
+* -----------------------------------------------------------------------------
+* BAT15-03W - general purpose RF Schottky
+* Very low capacitance (0.1 pF)
+*
+.MODEL BAT15 D (IS=1.2e-7 N=1.03 RS=4 CJO=0.1e-12 VJ=0.25 M=0.38 BV=4 IBV=1e-5 TT=2e-12)
+
+* -----------------------------------------------------------------------------
+* IDEAL_SCHOTTKY - Near-Ideal Diode for Theoretical Comparison
+* -----------------------------------------------------------------------------
+* Use this to compare your circuit against theoretical maximum performance
+* WARNING: Not realistic! Only for comparison purposes.
+*
+.MODEL IDEAL_SCHOTTKY D (IS=1e-5 N=1.0 RS=0.1 CJO=0.01e-12 VJ=0.2 M=0.5 BV=10 IBV=1e-4 TT=1e-12)
+
+* =============================================================================
+* END OF DIODE MODEL LIBRARY
+* =============================================================================

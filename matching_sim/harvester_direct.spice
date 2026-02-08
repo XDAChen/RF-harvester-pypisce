@@ -1,0 +1,28 @@
+* RF Energy Harvester - Pi Matching Network
+* 0 dBm input at 2.45 GHz
+* Pi-match: 50Ω → 30Ω
+
+* SMS7630 Schottky Diode Model
+.model SMS7630 D(IS=5e-06 N=1.05 RS=20 CJO=1.8e-13 VJ=0.34 M=0.4 BV=2 IBV=1e-4)
+
+* RF Source
+Vsrc input 0 SIN(0 0.31622776601683794 2450000000.0)
+
+* Source Resistance
+Rs input n1 50
+
+* Direct connection (no matching)
+D1 n1 output SMS7630
+
+* Output Stage
+Cout output 0 1e-10
+Rout output 0 10000.0
+
+* Analysis
+.tran 2.0408163265306123e-11 8.16326530612245e-08 0 1.0204081632653061e-11
+.control
+run
+plot v(output)
+.endc
+
+.end

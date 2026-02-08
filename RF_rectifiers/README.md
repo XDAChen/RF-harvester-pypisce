@@ -1,0 +1,252 @@
+# RF Rectifier Simulations
+
+Transient simulations of RF rectifier circuits at 2.45 GHz using ngspice.
+
+## Requirements
+
+- Python 3.10+
+- ngspice (circuit simulator)
+
+## Setup
+
+1. Install ngspice:
+   ```
+   # Linux (Ubuntu/Debian)
+   sudo apt install ngspice
+   
+   # macOS
+   brew install ngspice
+   
+   # Windows
+   # Download installer from https://ngspice.sourceforge.io/download.html
+   # Add ngspice to system PATH after installation
+   ```
+
+2. Create virtual environment:
+   ```
+   python3 -m venv .venv
+   source .venv/bin/activate      # Linux/macOS
+   .venv\Scripts\activate         # Windows
+   ```
+
+3. Install Python dependencies:
+   ```
+   pip install -r requirements.txt
+   ```
+
+## Usage
+
+Run simulations from the RF_rectifiers directory:
+
+```
+cd RF_rectifiers
+python halfwave_rectifier.py
+python dickson_rectifier.py
+```
+
+Each script will:
+- Print the generated SPICE netlist
+- Run transient simulation
+- Display results summary
+- Save plot as PNG
+
+## Files
+
+| File | Description |
+|------|-------------|
+| halfwave_rectifier.py | Single-diode half-wave rectifier |
+| dickson_rectifier.py | 2-stage Dickson charge pump |
+| utility.py | Shared simulation and plotting functions |
+| diode_models.lib | SPICE models for RF Schottky diodes |
+| requirements.txt | Python package dependencies |
+
+## Configuration
+
+Edit parameters at the top of each rectifier script:
+
+- `F_RF` - Operating frequency (default: 2.45 GHz)
+- `V_RF_AMPLITUDE` - Input amplitude in Volts
+- `R_SOURCE` - Source impedance (default: 50 ohms)
+- `C_IN`, `C_OUT`, `C_STAGE` - Capacitor values
+- `R_LOAD` - Load resistance
+- `CAP_Q` - Capacitor Q factor for ESR modeling
+- `DIODE_MODEL_NAME` - Diode model to use
+
+## Diode Models
+
+Available models in diode_models.lib:
+
+| Model | Description |
+|-------|-------------|
+| SMS7630 | Skyworks low-barrier Schottky (default) |
+| HSMS2850 | Avago low-barrier Schottky |
+| HSMS2860 | Avago medium-barrier Schottky |
+| BAT15 | Infineon RF Schottky |
+| DEFAULT_SCHOTTKY | Generic RF Schottky |
+| IDEAL_SCHOTTKY | Near-ideal (for comparison only) |
+
+To change diode model, edit `DIODE_MODEL_NAME` in the rectifier script.
+
+## Writing Your Own build_*_netlist() Function
+
+The netlist builder functions generate SPICE netlists as strings. This section explains the netlist syntax so you can create new circuits.
+
+### SPICE Netlist Basics
+
+```
+Circuit Title (first line, required)
+* Comments start with asterisk
+
+* Component syntax: TYPE_NAME NODE1 NODE2 [NODE3...] VALUE [MODEL]
+```
+
+### Component Syntax Reference
+
+| Component | Syntax | Example |
+|-----------|--------|---------|
+| Resistor | `Rname node1 node2 value` | `Rload vout 0 10000` |
+| Capacitor | `Cname node1 node2 value` | `Cout vout 0 100e-12` |
+| Diode | `Dname anode cathode MODEL` | `D1 node1 vout SMS7630` |
+| Voltage Source | `Vname node+ node- TYPE(params)` | `Vrf in 0 SIN(0 0.5 2.45e9)` |
+| Include file | `.include path` | `.include diode_models.lib` |
+
+### Node Naming
+
+- `0` is always ground
+- Other nodes are arbitrary names: `vout`, `node1`, `rf_in`, etc.
+- Components connect through shared node names
+
+### Sinusoidal Source
+
+```
+Vname node+ node- SIN(offset amplitude frequency)
+
+Example: Vrf rf_source 0 SIN(0 0.5 2.45e9)
+         |   |         |      |   |   |
+         |   |         |      |   |   +-- 2.45 GHz
+         |   |         |      |   +------ 0.5V amplitude
+         |   |         |      +---------- 0V DC offset
+         |   |         +----------------- ground (node-)
+         |   +--------------------------- positive node
+         +------------------------------- voltage source name
+```
+
+### Simulation Control Block
+
+```
+.control
+set filetype=ascii          ; output format
+tran 10p 50n uic            ; transient: step=10ps, stop=50ns, use initial conditions
+wrdata output.txt time v(node1) v(vout)   ; save data
+quit
+.endc
+
+.end                        ; end of netlist (required)
+```
+
+### Transient Analysis Syntax
+
+```
+tran step_time stop_time [start_time] [uic]
+     |          |                      |
+     |          |                      +-- use initial conditions
+     |          +------------------------- simulation end time
+     +------------------------------------ time step for output
+```
+
+### Example: Creating a New Rectifier
+
+```python
+def build_my_rectifier_netlist():
+    netlist = f"""My Custom Rectifier
+* Include models
+.include {model_path}
+
+* Source
+Vrf rf_in 0 SIN(0 {V_AMPLITUDE} {FREQ})
+Rsource rf_in input {R_SOURCE}
+
+* Your circuit here
+C1 input diode_in {C_VALUE}
+D1 diode_in output MY_DIODE_MODEL
+Cout output 0 {C_OUT}
+Rload output 0 {R_LOAD}
+
+* Simulation
+.control
+set filetype=ascii
+tran {STEP} {STOP} uic
+wrdata output.txt time v(input) v(output)
+quit
+.endc
+
+.end
+"""
+    return netlist, {}
+```
+
+### Tips
+
+- Node names are case-insensitive in ngspice
+- Use Python f-strings to insert parameter values
+- Add comments with `*` to document circuit sections
+- The `wrdata` signals must match what `run_*_simulation()` expects to parse
+
+## Using build_*_netlist() Functions
+
+The netlist builder functions can be imported and used in your own scripts for custom simulations or parameter sweeps.
+
+### Basic Usage
+
+```python
+from halfwave_rectifier import build_halfwave_netlist
+from dickson_rectifier import build_dickson_netlist
+
+# Build netlist - returns (netlist_string, esr_dict)
+netlist, esr_values = build_halfwave_netlist()
+
+# Print the SPICE netlist
+print(netlist)
+
+# Access ESR values used
+print(esr_values)  # {'esr_in': 0.065, 'esr_out': 0.0065}
+```
+
+### Running Simulation with Custom Netlist
+
+```python
+from halfwave_rectifier import build_halfwave_netlist, F_RF, V_RF_AMPLITUDE, R_LOAD, T_STOP, N_CYCLES, T_STEP
+from utility import run_halfwave_simulation, plot_halfwave_results
+
+# Build and run
+netlist, _ = build_halfwave_netlist()
+data = run_halfwave_simulation(netlist, T_STOP, N_CYCLES, T_STEP)
+plot_halfwave_results(data, F_RF, V_RF_AMPLITUDE, R_LOAD)
+```
+
+### Parameter Sweep Example
+
+```python
+import halfwave_rectifier as hw
+from utility import run_halfwave_simulation
+
+# Sweep input amplitude
+for amplitude in [0.2, 0.3, 0.5, 0.8, 1.0]:
+    hw.V_RF_AMPLITUDE = amplitude
+    netlist, _ = hw.build_halfwave_netlist()
+    data = run_halfwave_simulation(netlist, hw.T_STOP, hw.N_CYCLES, hw.T_STEP)
+    
+    # Extract DC output from last 20% of simulation
+    vout = data['vout']
+    v_dc = vout[int(0.8*len(vout)):].mean()
+    print(f"Vin={amplitude*1000:.0f}mV -> Vout={v_dc*1000:.2f}mV")
+```
+
+### Function Returns
+
+| Function | Returns |
+|----------|---------|
+| `build_halfwave_netlist()` | `(netlist_str, {'esr_in': float, 'esr_out': float})` |
+| `build_dickson_netlist()` | `(netlist_str, {'esr_stage': float, 'esr_out': float})` |
+
+The netlist string can be saved to a .sp file and run manually with ngspice if needed.
