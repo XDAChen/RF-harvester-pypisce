@@ -40,13 +40,13 @@ F_RF = 2.45e9           # 2.45 GHz ISM band
 T_RF = 1 / F_RF
 
 V_RF_AMPLITUDE = 0.3    # 300 mV peak (typical RF harvesting level)
-R_SOURCE = 50           # 50 Ohm source impedance
+R_SOURCE = 50           # 50 #note- not sure what is the impedance looking from the rectifier to the matching, but for rectifier only, i set it to 50 ohms
 
-C_IN = 10e-12           # 10 pF input coupling
+C_IN = 100e-12           # 100 pF input coupling
 C_OUT = 100e-12         # 100 pF output smoothing
 R_LOAD = 10e3           # 10 kOhm load
 
-CAP_Q = 100             # Capacitor Q factor
+CAP_Q = 30             # 30 is a more realistic number for commericial RF capacitors at GHz frequencies
 
 N_CYCLES = 100          # Enough cycles for steady-state
 T_STEP = T_RF / 40
@@ -73,7 +73,10 @@ def build_netlist(freq=F_RF, v_amp=V_RF_AMPLITUDE, c_in=C_IN, c_out=C_OUT,
     script_dir = Path(__file__).parent.absolute()
     model_path = script_dir / DIODE_MODEL_FILE
     
-    netlist = f"""Half-Wave RF Rectifier
+
+
+    ##############Note from Chen: this circuit is the replicate simulation of the RF rectifier in figure 2 of the paper. netlist is checked by Chen
+    netlist = f"""Half-Wave RF Rectifier 
 .include {model_path}
 
 Vrf rf_source 0 SIN(0 {v_amp} {freq})
@@ -81,6 +84,8 @@ Rsource rf_source rf_in {R_SOURCE}
 
 Cin rf_in node_c_in {c_in}
 Resr_in node_c_in diode_anode {esr_in}
+
+D2 0 diode_anode {DIODE_MODEL_NAME}
 
 D1 diode_anode vout {DIODE_MODEL_NAME}
 
