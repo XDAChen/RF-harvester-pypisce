@@ -69,6 +69,394 @@ def get_save_path(filename):
     return img_dir / filename
 
 
+# =============================================================================
+# WiFi Signal Generation (OFDM-like Multi-tone)
+# =============================================================================
+
+def generate_wifi_pwl_source(v_amplitude, center_freq=2.45e9, bw=20e6, n_tones=13,
+                             t_stop=100e-9, t_step=None):
+    """
+    Generate a pseudo-WiFi OFDM signal as PWL (Piecewise Linear) data for SPICE.
+    
+    802.11n WiFi at 2.4 GHz characteristics:
+    - 20 MHz channel bandwidth
+    - 64 subcarriers (52 data + 4 pilot + 8 null)
+    - Subcarrier spacing: 312.5 kHz
+    - High PAPR (Peak-to-Average Power Ratio) ~10-12 dB
+    
+    This function creates a multi-tone approximation with:
+    - n_tones spread uniformly across bw MHz
+    - Random initial phases for realistic PAPR
+    - Total power scaled to match single-tone equivalent
+    
+    Args:
+        v_amplitude: Equivalent single-tone amplitude (V peak)
+        center_freq: Center frequency in Hz (default 2.45 GHz)
+        bw: Bandwidth in Hz (default 20 MHz for WiFi)
+        n_tones: Number of subcarriers to simulate (default 13)
+        t_stop: Simulation duration in seconds
+        t_step: Time step (default: 1/40 of highest frequency period)
+    
+    Returns:
+        tuple: (time_array, voltage_array) for PWL source
+    """
+    if t_step is None:
+        f_max = center_freq + bw/2
+        t_step = 1.0 / (40 * f_max)
+    
+    t = np.arange(0, t_stop, t_step)
+    
+    # Generate subcarrier frequencies (spread across bandwidth)
+    freq_offsets = np.linspace(-bw/2, bw/2, n_tones)
+    freqs = center_freq + freq_offsets
+    
+    # Random phases for each subcarrier (creates realistic PAPR)
+    np.random.seed(42)  # Reproducible
+    phases = np.random.uniform(0, 2*np.pi, n_tones)
+    
+    # Each tone amplitude: scale so total power = single-tone power
+    # P_total = n_tones * (A_tone^2 / 2) = A_single^2 / 2
+    # A_tone = A_single / sqrt(n_tones)
+    a_tone = v_amplitude / np.sqrt(n_tones)
+    
+    # Sum all tones
+    v = np.zeros_like(t)
+    for i, (f, phi) in enumerate(zip(freqs, phases)):
+        v += a_tone * np.sin(2 * np.pi * f * t + phi)
+    
+    return t, v
+
+
+def get_wifi_spice_source(v_amplitude, center_freq=2.45e9, bw=20e6, n_tones=13):
+    """
+    Generate SPICE voltage source string for WiFi-like multi-tone signal.
+    
+    Uses multiple SIN sources in series to create OFDM-like spectrum.
+    
+    Args:
+        v_amplitude: Equivalent single-tone amplitude (V peak)
+        center_freq: Center frequency in Hz
+        bw: Bandwidth in Hz
+        n_tones: Number of subcarriers
+    
+    Returns:
+        str: SPICE netlist fragment with multi-tone source
+    """
+    freq_offsets = np.linspace(-bw/2, bw/2, n_tones)
+    freqs = center_freq + freq_offsets
+    
+    np.random.seed(42)
+    phases = np.random.uniform(0, 2*np.pi, n_tones)
+    phase_degrees = np.degrees(phases)
+    
+    a_tone = v_amplitude / np.sqrt(n_tones)
+    
+    lines = [f"* WiFi-like OFDM source: {n_tones} tones, {bw/1e6:.0f} MHz BW"]
+    
+    # Create series of voltage sources
+    for i, (f, phi_deg) in enumerate(zip(freqs, phase_degrees)):
+        node_p = f"wifi_n{i}" if i < n_tones - 1 else "rf_source"
+        node_n = f"wifi_n{i+1}" if i < n_tones - 1 else "0"
+        if i == 0:
+            node_n = "0"
+            node_p = f"wifi_n{i}"
+        lines.append(f"Vwifi{i} {node_p} {node_n} SIN(0 {a_tone} {f} 0 0 {phi_deg})")
+    
+    # Connect first node to rf_source
+    lines.append(f"Vwifi_link rf_source wifi_n0 0")
+    
+    return "\n".join(lines)
+
+
+# =============================================================================
+# WiFi Signal Generation using CommPy (Realistic 802.11 OFDM)
+# =============================================================================
+
+def generate_wifi_commpy(v_amplitude, center_freq=2.45e9, n_symbols=10,
+                          t_stop=100e-9, mcs=0, channel_bw=20):
+    """
+    Generate realistic WiFi 802.11 OFDM signal using scikit-commpy.
+    
+    Uses CommPy's wifi80211 module for standards-compliant 802.11 waveforms:
+    - Proper OFDM subcarrier structure (52 data + 4 pilot + 8 null for HT)
+    - Correct subcarrier spacing (312.5 kHz)
+    - Realistic PAPR characteristics
+    - Cyclic prefix support
+    
+    Args:
+        v_amplitude: Target RMS amplitude (V)
+        center_freq: Center frequency in Hz (default 2.45 GHz)
+        n_symbols: Number of OFDM symbols to generate
+        t_stop: Desired simulation duration in seconds
+        mcs: Modulation and Coding Scheme (0-7 for HT)
+        channel_bw: Channel bandwidth in MHz (20 or 40)
+    
+    Returns:
+        tuple: (time_array, voltage_array) for PWL source
+        dict: Signal info (papr_db, n_subcarriers, etc.)
+    """
+    try:
+        from commpy.modulation import QAMModem, ofdm_tx
+        import numpy as np
+    except ImportError:
+        print("[WARNING] scikit-commpy not installed. Using multi-tone approximation.")
+        t, v = generate_wifi_pwl_source(v_amplitude, center_freq)
+        return t, v, {'papr_db': 10, 'method': 'multi-tone', 'n_subcarriers': 13}
+    
+    # 802.11n HT parameters
+    n_fft = 64
+    n_data_subcarriers = 52  # 48 data + 4 pilot
+    cp_length = 16  # Cyclic prefix
+    subcarrier_spacing = 312.5e3  # Hz
+    symbol_duration = 1 / subcarrier_spacing  # 3.2 us
+    total_symbol_duration = symbol_duration + (cp_length / n_fft) * symbol_duration  # ~4 us
+    
+    # MCS to modulation mapping (simplified)
+    mcs_modulation = {
+        0: 2,   # BPSK
+        1: 4,   # QPSK
+        2: 4,   # QPSK
+        3: 16,  # 16-QAM
+        4: 16,  # 16-QAM
+        5: 64,  # 64-QAM
+        6: 64,  # 64-QAM
+        7: 64,  # 64-QAM
+    }
+    m_order = mcs_modulation.get(mcs, 4)  # Default QPSK
+    
+    # Generate random bits and modulate
+    bits_per_symbol = int(np.log2(m_order))
+    n_bits = n_symbols * n_data_subcarriers * bits_per_symbol
+    np.random.seed(42)  # Reproducible
+    bits = np.random.randint(0, 2, n_bits)
+    
+    # QAM modulation
+    modem = QAMModem(m_order)
+    symbols = modem.modulate(bits)
+    
+    # Reshape to OFDM symbols
+    symbols = symbols.reshape(n_symbols, -1)
+    
+    # Create OFDM spectrum (place data on subcarriers)
+    ofdm_symbols = np.zeros((n_symbols, n_fft), dtype=complex)
+    
+    # 802.11 subcarrier allocation: -26 to -1, +1 to +26
+    data_indices = list(range(-26, 0)) + list(range(1, 27))
+    data_indices = [(i + n_fft) % n_fft for i in data_indices]
+    
+    for i in range(n_symbols):
+        ofdm_symbols[i, data_indices] = symbols[i, :len(data_indices)]
+    
+    # IFFT to get time-domain signal
+    time_symbols = np.fft.ifft(ofdm_symbols, axis=1)
+    
+    # Add cyclic prefix
+    cp = time_symbols[:, -cp_length:]
+    time_with_cp = np.concatenate([cp, time_symbols], axis=1)
+    
+    # Flatten to continuous waveform
+    baseband = time_with_cp.flatten()
+    
+    # Scale to desired amplitude
+    rms_current = np.sqrt(np.mean(np.abs(baseband)**2))
+    baseband = baseband / rms_current * v_amplitude
+    
+    # Calculate PAPR
+    peak = np.max(np.abs(baseband))
+    rms = np.sqrt(np.mean(np.abs(baseband)**2))
+    papr_db = 20 * np.log10(peak / rms)
+    
+    # Upconvert to RF
+    sample_rate = n_fft * subcarrier_spacing
+    n_samples = len(baseband)
+    t_baseband = np.arange(n_samples) / sample_rate
+    
+    # Upsample for RF frequency (need ~40x carrier frequency)
+    upsample_factor = max(1, int(40 * center_freq / sample_rate))
+    t_rf = np.linspace(0, t_baseband[-1], len(baseband) * upsample_factor)
+    
+    # Interpolate baseband
+    from scipy.interpolate import interp1d
+    interp_real = interp1d(t_baseband, np.real(baseband), kind='linear', fill_value='extrapolate')
+    interp_imag = interp1d(t_baseband, np.imag(baseband), kind='linear', fill_value='extrapolate')
+    
+    baseband_up = interp_real(t_rf) + 1j * interp_imag(t_rf)
+    
+    # RF carrier
+    carrier = np.exp(1j * 2 * np.pi * center_freq * t_rf)
+    rf_signal = np.real(baseband_up * carrier)
+    
+    # Trim to desired duration
+    if t_stop is not None and t_rf[-1] > t_stop:
+        mask = t_rf <= t_stop
+        t_rf = t_rf[mask]
+        rf_signal = rf_signal[mask]
+    
+    info = {
+        'papr_db': papr_db,
+        'method': 'commpy_ofdm',
+        'n_subcarriers': n_data_subcarriers,
+        'n_fft': n_fft,
+        'mcs': mcs,
+        'modulation': m_order,
+        'symbol_duration_us': total_symbol_duration * 1e6,
+        'sample_rate_mhz': sample_rate / 1e6,
+    }
+    
+    return t_rf, rf_signal, info
+
+
+def plot_wifi_spectrum_commpy(v_amplitude, center_freq=2.45e9, n_symbols=10,
+                               mcs=0, save_prefix='wifi_spectrum'):
+    """
+    Plot WiFi signal spectrum using CommPy-generated OFDM (publication style).
+    
+    Args:
+        v_amplitude: Target RMS amplitude (V)
+        center_freq: Center frequency in Hz
+        n_symbols: Number of OFDM symbols
+        mcs: Modulation and Coding Scheme
+        save_prefix: Output filename prefix
+    
+    Returns:
+        Figure object, signal info dict
+    """
+    apply_pub_style()
+    
+    # Generate signal
+    t, v, info = generate_wifi_commpy(v_amplitude, center_freq, n_symbols,
+                                       t_stop=2e-6, mcs=mcs)
+    
+    # FFT analysis
+    n_fft = len(v)
+    dt = t[1] - t[0] if len(t) > 1 else 1e-12
+    fft_v = np.fft.fft(v)
+    freqs = np.fft.fftfreq(n_fft, dt)
+    mag = np.abs(fft_v) / n_fft * 2
+    
+    # Convert to dB (relative to carrier)
+    mag_db = 20 * np.log10(mag / np.max(mag) + 1e-10)
+    
+    # Plot around center frequency
+    bw = 40e6  # Show ±40 MHz
+    mask = (freqs > center_freq - bw) & (freqs < center_freq + bw)
+    freq_offset_mhz = (freqs[mask] - center_freq) / 1e6
+    
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
+    
+    # Spectrum plot (dB)
+    ax1.plot(freq_offset_mhz, mag_db[mask], 'k-', lw=0.8, alpha=0.8)
+    ax1.set_xlabel('Frequency Offset from 2.45 GHz (MHz)')
+    ax1.set_ylabel('Magnitude (dB)')
+    ax1.set_xlim([-30, 30])
+    ax1.set_ylim([-60, 5])
+    
+    # Add WiFi channel bandwidth shading
+    ax1.axvspan(-10, 10, alpha=0.15, color='blue', label='20 MHz Channel')
+    ax1.axvline(-10, color='blue', ls='--', lw=1.5, alpha=0.7)
+    ax1.axvline(10, color='blue', ls='--', lw=1.5, alpha=0.7)
+    ax1.legend(loc='upper right', fontsize=16)
+    
+    # Add info box
+    info_text = (f"CommPy OFDM WiFi\n"
+                 f"MCS: {info['mcs']} ({info['modulation']}-QAM)\n"
+                 f"PAPR: {info['papr_db']:.1f} dB\n"
+                 f"{info['n_subcarriers']} subcarriers")
+    ax1.text(0.05, 0.05, info_text, transform=ax1.transAxes, fontsize=14,
+             verticalalignment='bottom', bbox=dict(boxstyle='round', 
+             facecolor='white', edgecolor='black', alpha=0.9))
+    
+    # Time-domain plot (first ~100 ns)
+    t_ns = t * 1e9
+    mask_time = t_ns < 100
+    ax2.plot(t_ns[mask_time], v[mask_time] * 1000, 'k-', lw=0.8)
+    ax2.set_xlabel('Time (ns)')
+    ax2.set_ylabel('Amplitude (mV)')
+    ax2.set_xlim([0, 100])
+    
+    # Calculate and show peak
+    peak_v = np.max(np.abs(v)) * 1000
+    rms_v = np.sqrt(np.mean(v**2)) * 1000
+    ax2.axhline(peak_v, color='red', ls=':', lw=1.5, alpha=0.7)
+    ax2.axhline(-peak_v, color='red', ls=':', lw=1.5, alpha=0.7)
+    ax2.axhline(rms_v, color='green', ls='--', lw=1.5, alpha=0.7)
+    ax2.axhline(-rms_v, color='green', ls='--', lw=1.5, alpha=0.7)
+    
+    ax2.text(0.95, 0.95, f"Peak: {peak_v:.1f} mV\nRMS: {rms_v:.1f} mV",
+             transform=ax2.transAxes, fontsize=14, ha='right', va='top',
+             bbox=dict(boxstyle='round', facecolor='white', edgecolor='black'))
+    
+    for ax in [ax1, ax2]:
+        for spine in ax.spines.values():
+            spine.set_linewidth(2)
+        ax.locator_params(axis='x', nbins=7)
+        ax.locator_params(axis='y', nbins=5)
+    
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path}'")
+    print(f"[INFO] CommPy OFDM: PAPR={info['papr_db']:.1f} dB, {info['n_subcarriers']} subcarriers")
+    plt.show()
+    return fig, info
+
+
+def plot_wifi_spectrum(v_amplitude, center_freq=2.45e9, bw=20e6, n_tones=13,
+                       save_prefix='wifi_spectrum'):
+    """
+    Plot the WiFi-like signal spectrum (publication style).
+    
+    Args:
+        v_amplitude: Equivalent single-tone amplitude
+        center_freq: Center frequency
+        bw: Bandwidth
+        n_tones: Number of tones
+        save_prefix: Output filename prefix
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    
+    # Generate time-domain signal
+    t, v = generate_wifi_pwl_source(v_amplitude, center_freq, bw, n_tones, 
+                                     t_stop=1e-6, t_step=1e-12)
+    
+    # FFT
+    n_fft = len(v)
+    dt = t[1] - t[0]
+    fft_v = np.fft.fft(v)
+    freqs = np.fft.fftfreq(n_fft, dt)
+    mag = np.abs(fft_v) / n_fft * 2  # Single-sided
+    
+    # Plot only positive frequencies around center
+    mask = (freqs > center_freq - bw) & (freqs < center_freq + bw)
+    
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot((freqs[mask] - center_freq) / 1e6, mag[mask] * 1000, 'k-', lw=1.5)
+    ax.set_xlabel('Frequency Offset from 2.45 GHz (MHz)')
+    ax.set_ylabel('Amplitude (mV)')
+    ax.set_xlim([-bw/1e6, bw/1e6])
+    
+    # Add channel bandwidth annotation
+    ax.axvline(-bw/2/1e6, color='gray', ls='--', lw=1.5, alpha=0.7)
+    ax.axvline(bw/2/1e6, color='gray', ls='--', lw=1.5, alpha=0.7)
+    ax.text(0.95, 0.95, f"WiFi 20 MHz Channel\n{n_tones} subcarriers",
+            transform=ax.transAxes, fontsize=16, ha='right', va='top',
+            bbox=dict(boxstyle='round', facecolor='white', edgecolor='black'))
+    
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    ax.locator_params(axis='x', nbins=7)
+    ax.locator_params(axis='y', nbins=5)
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
 # PySpice imports
 from PySpice.Spice.NgSpice.Shared import NgSpiceShared
 from PySpice.Spice.Parser import SpiceParser
@@ -714,9 +1102,9 @@ def run_dickson_simulation(netlist, t_stop, n_cycles, t_step):
 
 def plot_halfwave_results(data, f_rf, v_rf_amplitude, r_load, 
                           save_prefix='halfwave_transient'):
-    """Plot halfwave rectifier transient results as individual plots."""
+    """Plot halfwave rectifier transient results - input and output superimposed."""
     apply_pub_style()
-    time = data['time'] * 1e9
+    time = data['time'] * 1e9  # Convert to ns
     v_rf = data['rf_in']
     v_out = data['vout']
     
@@ -732,34 +1120,36 @@ def plot_halfwave_results(data, f_rf, v_rf_amplitude, r_load,
     print(f"Power:        {v_dc**2/r_load*1e6:.2f} uW")
     print(f"{'='*50}")
     
-    # Plot 1: Input signal
-    fig1, ax1 = plt.subplots(figsize=(12, 8))
-    ax1.plot(time, v_rf, 'k-', lw=2)
+    # Combined plot: Input and Output superimposed
+    fig, ax1 = plt.subplots(figsize=(14, 8))
+    
+    # Input signal (left y-axis)
+    color_in = 'black'
+    ax1.plot(time, v_rf, color=color_in, ls='-', lw=2, label='RF Input')
     ax1.set_xlabel('Time (ns)')
-    ax1.set_ylabel('Input Voltage (V)')
+    ax1.set_ylabel('RF Input (V)', color=color_in)
+    ax1.tick_params(axis='y', labelcolor=color_in)
     for spine in ax1.spines.values():
         spine.set_linewidth(2)
-    ax1.locator_params(axis='x', nbins=6)
-    ax1.locator_params(axis='y', nbins=5)
-    plt.tight_layout()
-    save_path = get_save_path(f'{save_prefix}_input.png')
-    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
-    print(f"[INFO] Saved '{save_path}'")
-    plt.show()
     
-    # Plot 2: Output signal
-    fig2, ax2 = plt.subplots(figsize=(12, 8))
-    ax2.plot(time, v_out, 'k-', lw=2, label='Output')
-    ax2.axhline(v_dc, color='k', ls='--', lw=2, label=f'DC = {v_dc*1e3:.2f} mV')
-    ax2.set_xlabel('Time (ns)')
-    ax2.set_ylabel('Output Voltage (V)')
-    ax2.legend(loc='lower right')
+    # Output signal (right y-axis)
+    ax2 = ax1.twinx()
+    color_out = 'black'
+    ax2.plot(time, v_out, color=color_out, ls='--', lw=2, label='DC Output')
+    ax2.axhline(v_dc, color=color_out, ls=':', lw=2, label=f'DC = {v_dc*1e3:.2f} mV')
+    ax2.set_ylabel('DC Output (V)', color=color_out)
+    ax2.tick_params(axis='y', labelcolor=color_out)
     for spine in ax2.spines.values():
         spine.set_linewidth(2)
-    ax2.locator_params(axis='x', nbins=6)
-    ax2.locator_params(axis='y', nbins=5)
+    
+    # Combined legend
+    lines1, labels1 = ax1.get_legend_handles_labels()
+    lines2, labels2 = ax2.get_legend_handles_labels()
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
+    
+    ax1.locator_params(axis='x', nbins=6)
     plt.tight_layout()
-    save_path = get_save_path(f'{save_prefix}_output.png')
+    save_path = get_save_path(f'{save_prefix}_waveforms.png')
     plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"[INFO] Saved '{save_path}'")
     plt.show()
@@ -834,3 +1224,410 @@ def plot_dickson_results(data, n_stages, f_rf, v_rf_amplitude, r_load,
     plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"[INFO] Saved '{save_path}'")
     plt.show()
+
+
+# =============================================================================
+# Frequency Sweep Plotting (Publication Style)
+# =============================================================================
+
+def plot_freq_sweep_dc(freq_ghz, v_dc_mv, save_prefix='halfwave_freq_sweep'):
+    """
+    Plot DC output vs frequency (publication style).
+    
+    Args:
+        freq_ghz: Frequency array in GHz
+        v_dc_mv: DC output array in mV
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(freq_ghz, v_dc_mv, 'k-', lw=2, marker='o', ms=10, mfc='white', mew=2)
+    ax.set_xlabel('Frequency (GHz)')
+    ax.set_ylabel('DC Output (mV)')
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    ax.locator_params(axis='x', nbins=6)
+    ax.locator_params(axis='y', nbins=5)
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}_dc.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"\n[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
+def plot_freq_sweep_power(freq_ghz, p_out_uw, save_prefix='halfwave_freq_sweep'):
+    """
+    Plot output power vs frequency (publication style).
+    
+    Args:
+        freq_ghz: Frequency array in GHz
+        p_out_uw: Output power array in uW
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(freq_ghz, p_out_uw, 'k--', lw=2, marker='s', ms=10, mfc='white', mew=2)
+    ax.set_xlabel('Frequency (GHz)')
+    ax.set_ylabel('Output Power (uW)')
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    ax.locator_params(axis='x', nbins=6)
+    ax.locator_params(axis='y', nbins=5)
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}_power.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
+# =============================================================================
+# Sensitivity Analysis Plotting (Publication Style)
+# =============================================================================
+
+def plot_sens_input_amplitude(v_amp_mv, v_dc_mv, save_prefix='halfwave_sens'):
+    """
+    Plot DC output vs input amplitude (publication style).
+    
+    Args:
+        v_amp_mv: Input amplitude array in mV
+        v_dc_mv: DC output array in mV
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.plot(v_amp_mv, v_dc_mv, 'k-', lw=2, marker='o', ms=10, mfc='white', mew=2)
+    ax.set_xlabel('Input Amplitude (mV)')
+    ax.set_ylabel('DC Output (mV)')
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    ax.locator_params(axis='x', nbins=5)
+    ax.locator_params(axis='y', nbins=5)
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}_input_amplitude.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"\n[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
+def plot_sens_combined(v_amp_mv, v_dc_amp_mv, c_out_pf, v_dc_cout_mv, 
+                       save_prefix='halfwave_sens'):
+    """
+    Combined sensitivity plot: Input amplitude (top x-axis) and Cout (bottom x-axis)
+    both vs DC output (shared y-axis). Publication style.
+    
+    This shows two different sensitivities in one plot:
+    - How DC output varies with input RF amplitude
+    - How DC output varies with output capacitor size
+    
+    Args:
+        v_amp_mv: Input amplitude array in mV
+        v_dc_amp_mv: DC output array for amplitude sweep in mV
+        c_out_pf: Output capacitor array in pF
+        v_dc_cout_mv: DC output array for capacitor sweep in mV
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax1 = plt.subplots(figsize=(12, 8))
+    
+    # Bottom x-axis: Output capacitor (log scale)
+    color1 = 'black'
+    line1, = ax1.semilogx(c_out_pf, v_dc_cout_mv, color=color1, ls='--', lw=2, 
+                          marker='s', ms=10, mfc='white', mew=2, label='vs C_out')
+    ax1.set_xlabel('Output Capacitor (pF)', color=color1)
+    ax1.set_ylabel('DC Output (mV)')
+    ax1.tick_params(axis='x', labelcolor=color1)
+    for spine in ax1.spines.values():
+        spine.set_linewidth(2)
+    
+    # Top x-axis: Input amplitude (linear scale)
+    ax2 = ax1.twiny()
+    color2 = 'black'
+    line2, = ax2.plot(v_amp_mv, v_dc_amp_mv, color=color2, ls='-', lw=2,
+                      marker='o', ms=10, mfc='white', mew=2, label='vs V_in')
+    ax2.set_xlabel('Input Amplitude (mV)', color=color2)
+    ax2.tick_params(axis='x', labelcolor=color2)
+    for spine in ax2.spines.values():
+        spine.set_linewidth(2)
+    
+    # Combined legend
+    ax1.legend([line2, line1], ['vs Input Amplitude (top axis)', 'vs Output Capacitor (bottom axis)'],
+               loc='lower right')
+    
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}_combined.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"\n[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
+def plot_sens_load_resistance(r_load_kohm, v_dc_mv, p_out_uw, save_prefix='halfwave_sens'):
+    """
+    Plot DC output and power vs load resistance (publication style, dual y-axis).
+    
+    Args:
+        r_load_kohm: Load resistance array in kOhm
+        v_dc_mv: DC output array in mV
+        p_out_uw: Output power array in uW
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.semilogx(r_load_kohm, v_dc_mv, 'k-', lw=2, marker='o', ms=10, mfc='white', mew=2, label='DC Voltage')
+    ax.set_xlabel('Load Resistance (kOhm)')
+    ax.set_ylabel('DC Output (mV)')
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    
+    ax_right = ax.twinx()
+    ax_right.semilogx(r_load_kohm, p_out_uw, 'k--', lw=2, marker='s', ms=10, mfc='white', mew=2, label='Power')
+    ax_right.set_ylabel('Power (uW)')
+    for spine in ax_right.spines.values():
+        spine.set_linewidth(2)
+    
+    lines1, labels1 = ax.get_legend_handles_labels()
+    lines2, labels2 = ax_right.get_legend_handles_labels()
+    ax.legend(lines1 + lines2, labels1 + labels2, loc='center right')
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}_load_resistance.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
+def plot_sens_capacitor_dc(c_out_pf, v_dc_mv, save_prefix='halfwave_sens'):
+    """
+    Plot DC output vs output capacitor (publication style).
+    
+    Args:
+        c_out_pf: Output capacitor array in pF
+        v_dc_mv: DC output array in mV
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.semilogx(c_out_pf, v_dc_mv, 'k-', lw=2, marker='o', ms=10, mfc='white', mew=2)
+    ax.set_xlabel('Output Capacitor (pF)')
+    ax.set_ylabel('DC Output (mV)')
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}_cout_dc.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
+def plot_sens_capacitor_ripple(c_out_pf, ripple_mv, save_prefix='halfwave_sens'):
+    """
+    Plot ripple vs output capacitor (publication style).
+    
+    Args:
+        c_out_pf: Output capacitor array in pF
+        ripple_mv: Ripple array in mV pk-pk
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.semilogx(c_out_pf, ripple_mv, 'k--', lw=2, marker='s', ms=10, mfc='white', mew=2)
+    ax.set_xlabel('Output Capacitor (pF)')
+    ax.set_ylabel('Ripple (mV pk-pk)')
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}_cout_ripple.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
+# =============================================================================
+# Monte Carlo Plotting (Publication Style)
+# =============================================================================
+
+def plot_mc_histogram(values, mean, std, xlabel, hatch='///', save_name='mc_hist.png'):
+    """
+    Plot Monte Carlo histogram (publication style).
+    
+    Args:
+        values: Array of metric values
+        mean: Mean value
+        std: Standard deviation
+        xlabel: X-axis label
+        hatch: Hatch pattern for bars
+        save_name: Output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.hist(values, bins=15, color='white', edgecolor='black', linewidth=2, hatch=hatch)
+    ax.axvline(mean, color='black', ls='--', lw=3)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel('Count')
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    ax.locator_params(axis='x', nbins=5)
+    ax.text(0.95, 0.95, f"mean = {mean:.2f}\nstd = {std:.2f}",
+            transform=ax.transAxes, fontsize=18, fontweight='bold', ha='right', va='top',
+            bbox=dict(boxstyle='round', facecolor='white', edgecolor='black'))
+    plt.tight_layout()
+    save_path = get_save_path(save_name)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig
+
+
+def plot_mc_dc(v_dc_mv, stats, save_prefix='halfwave_mc'):
+    """
+    Plot Monte Carlo DC output histogram (publication style).
+    
+    Args:
+        v_dc_mv: Array of DC output values in mV
+        stats: Dict with 'mean' and 'std' keys
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    return plot_mc_histogram(
+        v_dc_mv, 
+        stats['mean'], stats['std'],
+        'DC Output (mV)', 
+        hatch='///',
+        save_name=f'{save_prefix}_dc.png'
+    )
+
+
+def plot_mc_ripple(ripple_mv, stats, save_prefix='halfwave_mc'):
+    """
+    Plot Monte Carlo ripple histogram (publication style).
+    
+    Args:
+        ripple_mv: Array of ripple values in mV
+        stats: Dict with 'mean' and 'std' keys
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    return plot_mc_histogram(
+        ripple_mv,
+        stats['mean'], stats['std'],
+        'Ripple (mV)',
+        hatch='xxx',
+        save_name=f'{save_prefix}_ripple.png'
+    )
+
+
+def plot_mc_power(p_out_uw, stats, save_prefix='halfwave_mc'):
+    """
+    Plot Monte Carlo power histogram (publication style).
+    
+    Args:
+        p_out_uw: Array of power values in uW
+        stats: Dict with 'mean' and 'std' keys
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    return plot_mc_histogram(
+        p_out_uw,
+        stats['mean'], stats['std'],
+        'Power (uW)',
+        hatch='...',
+        save_name=f'{save_prefix}_power.png'
+    )
+
+
+# =============================================================================
+# Frequency Stability Plotting (Publication Style)
+# =============================================================================
+
+def plot_freq_stability(freq_mhz_offset, v_dc_normalized, bw_3db_mhz=None, 
+                        wifi_bw_mhz=20, save_prefix='halfwave_freq_stability'):
+    """
+    Plot frequency stability / narrowband response (publication style).
+    Shows rectifier response across frequency drift, with WiFi channel bandwidth indicated.
+    
+    Args:
+        freq_mhz_offset: Frequency offset from center in MHz (e.g., -20 to +20)
+        v_dc_normalized: Normalized DC output (1.0 at center frequency)
+        bw_3db_mhz: Optional -3dB bandwidth annotation in MHz
+        wifi_bw_mhz: WiFi channel bandwidth to shade (default 20 MHz)
+        save_prefix: Prefix for output filename
+    
+    Returns:
+        Figure object
+    """
+    apply_pub_style()
+    fig, ax = plt.subplots(figsize=(12, 8))
+    
+    # Shade WiFi channel bandwidth region
+    ax.axvspan(-wifi_bw_mhz/2, wifi_bw_mhz/2, alpha=0.15, color='gray',
+               label=f'WiFi {wifi_bw_mhz} MHz channel')
+    
+    # Plot normalized response
+    ax.plot(freq_mhz_offset, v_dc_normalized, 'k-', lw=2, marker='o', ms=8, mfc='white', mew=2,
+            label='DC Response')
+    
+    # Add -3dB reference line
+    ax.axhline(1/np.sqrt(2), color='black', ls='--', lw=2, label='-3 dB')
+    ax.axhline(1.0, color='black', ls=':', lw=1.5, alpha=0.5)
+    
+    # Mark ±10 MHz drift boundaries (WiFi channel edge drift)
+    ax.axvline(-10, color='gray', ls=':', lw=1.5, alpha=0.7)
+    ax.axvline(10, color='gray', ls=':', lw=1.5, alpha=0.7)
+    
+    ax.set_xlabel('Center Frequency Offset (MHz)')
+    ax.set_ylabel('Normalized DC Output')
+    ax.set_ylim([0, 1.15])
+    
+    for spine in ax.spines.values():
+        spine.set_linewidth(2)
+    ax.locator_params(axis='x', nbins=9)
+    ax.locator_params(axis='y', nbins=5)
+    
+    # Add bandwidth annotation if provided
+    if bw_3db_mhz is not None:
+        ax.text(0.95, 0.85, f"BW$_{{-3dB}}$ = {bw_3db_mhz:.1f} MHz",
+                transform=ax.transAxes, fontsize=16, fontweight='bold', ha='right', va='top',
+                bbox=dict(boxstyle='round', facecolor='white', edgecolor='black'))
+    
+    ax.legend(loc='lower left', fontsize=16)
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"\n[INFO] Saved '{save_path}'")
+    plt.show()
+    return fig

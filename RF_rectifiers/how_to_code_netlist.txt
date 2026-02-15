@@ -1,165 +1,93 @@
-# Writing Your Own build_*_netlist() Function
+# SPICE Netlist Reference
 
-The netlist builder functions generate SPICE netlists as strings. This section explains the netlist syntax so you can create new circuits.
+Guide for writing build_netlist() functions that generate SPICE netlists.
 
-## SPICE Netlist Basics
+## Netlist Structure
 
 ```
-Circuit Title (first line, required)
-* Comments start with asterisk
-
-* Component syntax: TYPE_NAME NODE1 NODE2 [NODE3...] VALUE [MODEL]
+Circuit Title
+* Comment line
+Component definitions...
+.control
+  simulation commands
+.endc
+.end
 ```
 
-## Component Syntax Reference
+## Component Syntax
 
 | Component | Syntax | Example |
 |-----------|--------|---------|
-| Resistor | `Rname node1 node2 value` | `Rload vout 0 10000` |
-| Capacitor | `Cname node1 node2 value` | `Cout vout 0 100e-12` |
-| Diode | `Dname anode cathode MODEL` | `D1 node1 vout SMS7630` |
-| Voltage Source | `Vname node+ node- TYPE(params)` | `Vrf in 0 SIN(0 0.5 2.45e9)` |
-| Include file | `.include path` | `.include diode_models.lib` |
+| Resistor | Rname n1 n2 value | Rload vout 0 5k |
+| Capacitor | Cname n1 n2 value | Cout vout 0 100p |
+| Diode | Dname anode cathode MODEL | D1 in vout SMS7630 |
+| Voltage | Vname n+ n- TYPE(params) | Vrf in 0 SIN(0 0.3 2.45e9) |
+| Include | .include path | .include diode_models.lib |
 
-## Node Naming
-
-- `0` is always ground
-- Other nodes are arbitrary names: `vout`, `node1`, `rf_in`, etc.
-- Components connect through shared node names
+Node 0 is ground. Other names are arbitrary.
 
 ## Sinusoidal Source
 
 ```
-Vname node+ node- SIN(offset amplitude frequency)
-
-Example: Vrf rf_source 0 SIN(0 0.5 2.45e9)
-         |   |         |      |   |   |
-         |   |         |      |   |   +-- 2.45 GHz
-         |   |         |      |   +------ 0.5V amplitude
-         |   |         |      +---------- 0V DC offset
-         |   |         +----------------- ground (node-)
-         |   +--------------------------- positive node
-         +------------------------------- voltage source name
+Vrf rf_source 0 SIN(offset amplitude frequency)
+    |                  |      |         |
+    |                  |      |         +-- Hz
+    |                  |      +------------ V peak
+    |                  +------------------- V DC
+    +-------------------------------------- name
 ```
 
-## Simulation Control Block
+## Transient Simulation
 
 ```
-.control
-set filetype=ascii          ; output format
-tran 10p 50n uic            ; transient: step=10ps, stop=50ns, use initial conditions
-wrdata output.txt time v(node1) v(vout)   ; save data
-quit
-.endc
-
-.end                        ; end of netlist (required)
-```
-
-## Transient Analysis Syntax
-
-```
-tran step_time stop_time [start_time] [uic]
-     |          |                      |
-     |          |                      +-- use initial conditions
-     |          +------------------------- simulation end time
-     +------------------------------------ time step for output
-```
-
-## Example: Creating a New Rectifier
-
-```python
-def build_my_rectifier_netlist():
-    netlist = f"""My Custom Rectifier
-* Include models
-.include {model_path}
-
-* Source
-Vrf rf_in 0 SIN(0 {V_AMPLITUDE} {FREQ})
-Rsource rf_in input {R_SOURCE}
-
-* Your circuit here
-C1 input diode_in {C_VALUE}
-D1 diode_in output MY_DIODE_MODEL
-Cout output 0 {C_OUT}
-Rload output 0 {R_LOAD}
-
-* Simulation
 .control
 set filetype=ascii
-tran {STEP} {STOP} uic
-wrdata output.txt time v(input) v(output)
+tran 10p 50n uic
+wrdata output.txt time v(rf_in) v(vout)
 quit
 .endc
+```
 
+tran syntax: `tran step stop [start] [uic]`
+
+## Example Function
+
+```python
+def build_netlist(freq=2.45e9, amplitude=0.3):
+    netlist = f"""Half-wave Rectifier
+.include diode_models.lib
+
+Vrf rf_in 0 SIN(0 {amplitude} {freq})
+Rs rf_in input 50
+Cin input diode_in 100p
+D1 diode_in vout SMS7630
+Cout vout 0 100p
+Rload vout 0 5k
+
+.control
+set filetype=ascii
+tran 10p 50n uic
+wrdata sim_data.txt time v(rf_in) v(vout)
+quit
+.endc
 .end
 """
-    return netlist, {}
+    return netlist
+```
+
+## Using Build Functions
+
+```python
+from halfwave_rectifier import build_netlist
+from utility import run_halfwave_simulation
+
+netlist, t_stop, n_cyc, t_step = build_netlist()
+data = run_halfwave_simulation(netlist, t_stop, n_cyc, t_step)
 ```
 
 ## Tips
 
-- Node names are case-insensitive in ngspice
-- Use Python f-strings to insert parameter values
-- Add comments with `*` to document circuit sections
-- The `wrdata` signals must match what `run_*_simulation()` expects to parse
-
----
-
-# Using build_*_netlist() Functions
-
-The netlist builder functions can be imported and used in your own scripts for custom simulations or parameter sweeps.
-
-## Basic Usage
-
-```python
-from halfwave_rectifier import build_halfwave_netlist
-from dickson_rectifier import build_dickson_netlist
-
-# Build netlist - returns (netlist_string, esr_dict)
-netlist, esr_values = build_halfwave_netlist()
-
-# Print the SPICE netlist
-print(netlist)
-
-# Access ESR values used
-print(esr_values)  # {'esr_in': 0.065, 'esr_out': 0.0065}
-```
-
-## Running Simulation with Custom Netlist
-
-```python
-from halfwave_rectifier import build_halfwave_netlist, F_RF, V_RF_AMPLITUDE, R_LOAD, T_STOP, N_CYCLES, T_STEP
-from utility import run_halfwave_simulation, plot_halfwave_results
-
-# Build and run
-netlist, _ = build_halfwave_netlist()
-data = run_halfwave_simulation(netlist, T_STOP, N_CYCLES, T_STEP)
-plot_halfwave_results(data, F_RF, V_RF_AMPLITUDE, R_LOAD)
-```
-
-## Parameter Sweep Example
-
-```python
-import halfwave_rectifier as hw
-from utility import run_halfwave_simulation
-
-# Sweep input amplitude
-for amplitude in [0.2, 0.3, 0.5, 0.8, 1.0]:
-    hw.V_RF_AMPLITUDE = amplitude
-    netlist, _ = hw.build_halfwave_netlist()
-    data = run_halfwave_simulation(netlist, hw.T_STOP, hw.N_CYCLES, hw.T_STEP)
-    
-    # Extract DC output from last 20% of simulation
-    vout = data['vout']
-    v_dc = vout[int(0.8*len(vout)):].mean()
-    print(f"Vin={amplitude*1000:.0f}mV -> Vout={v_dc*1000:.2f}mV")
-```
-
-## Function Returns
-
-| Function | Returns |
-|----------|---------|
-| `build_halfwave_netlist()` | `(netlist_str, {'esr_in': float, 'esr_out': float})` |
-| `build_dickson_netlist()` | `(netlist_str, {'esr_stage': float, 'esr_out': float})` |
-
-The netlist string can be saved to a .sp file and run manually with ngspice if needed.
+- Node names are case-insensitive
+- Use f-strings for parameter insertion
+- wrdata signals must match what run_*_simulation() parses
+- Comments with * help document circuit sections
