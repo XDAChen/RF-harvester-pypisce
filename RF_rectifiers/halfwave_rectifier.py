@@ -4,10 +4,11 @@
 Half-Wave RF Rectifier - Full Analysis Suite at 2.45 GHz
 ================================================================================
 RF energy harvesting rectifier with:
-    1. Transient simulation
+    1. Transient simulation (with/without Pi-match)
     2. Harmonic analysis
     3. Frequency sweep
     4. Sensitivity / Monte Carlo analysis
+    5. Pi-match network optimization integration
 
 Author: RF Energy Harvesting Team
 Date: 2026
@@ -20,7 +21,9 @@ from pathlib import Path
 from utility import (
     calculate_esr_from_q,
     run_halfwave_simulation,
+    run_matched_rectifier_simulation,
     plot_halfwave_results,
+    plot_matched_rectifier_results,
     harmonic_analysis,
     plot_harmonics,
     extract_dc_metrics,
@@ -35,6 +38,13 @@ from utility import (
     plot_mc_power,
 )
 
+# Import Pi-match and optimization modules
+from pi_match import (
+    PiMatchNetwork, Inductor, Capacitor,
+    create_pi_match_from_values, design_pi_match
+)
+from optimization import optimize_pi_match, OptimizationResult
+
 
 # =============================================================================
 # Circuit Parameters - 2.45 GHz RF Energy Harvesting
@@ -44,13 +54,24 @@ F_RF = 2.45e9           # 2.45 GHz ISM band
 T_RF = 1 / F_RF
 
 V_RF_AMPLITUDE = 0.3    # 300 mV peak (typical RF harvesting level)
-R_SOURCE = 50           # 50 #note- not sure what is the impedance looking from the rectifier to the matching, but for rectifier only, i set it to 50 ohms
 
-C_IN = 100e-12           # 100 pF input coupling
+# Antenna / Source impedance (will be matched by Pi-network)
+ANT_IMP = 50            # Antenna impedance (Ohms) - typical 50 Ohm antenna
+
+# Estimated rectifier input impedance (load for Pi-match)
+RECT_IMP_EST = 30       # Estimated rectifier input impedance (Ohms)
+
+# Legacy parameter for backwards compatibility
+R_SOURCE = ANT_IMP
+
+C_IN = 100e-12          # 100 pF input coupling
 C_OUT = 100e-12         # 100 pF output smoothing
 R_LOAD = 5e3            # 5 kOhm load (fixed for sensitivity analysis)
 
-CAP_Q = 30             # 30 is a more realistic number for commericial RF capacitors at GHz frequencies
+# Quality factors for non-ideal components
+CAP_Q = 30              # Capacitor Q (realistic for commercial RF caps at GHz)
+IND_Q = 50              # Inductor Q (realistic for SMD inductors at GHz)
+PI_MATCH_CAP_Q = 100    # Higher Q caps for matching network
 
 N_CYCLES = 100          # Enough cycles for steady-state
 T_STEP = T_RF / 40
@@ -59,14 +80,18 @@ T_STOP = N_CYCLES * T_RF
 DIODE_MODEL_FILE = "diode_models.lib"
 DIODE_MODEL_NAME = "SMS7630"
 
+# Pi-Match design targets
+PI_MATCH_TARGET_RL_DB = -20   # Target return loss (dB)
+PI_MATCH_TARGET_BW_MHZ = 30   # Target bandwidth (MHz)
+
 
 # =============================================================================
-# Netlist Builder
+# Netlist Builder - Direct (No Matching)
 # =============================================================================
 
 def build_netlist(freq=F_RF, v_amp=V_RF_AMPLITUDE, c_in=C_IN, c_out=C_OUT, 
-                  r_load=R_LOAD, n_cycles=N_CYCLES):
-    """Build SPICE netlist with given parameters."""
+                  r_load=R_LOAD, n_cycles=N_CYCLES, ant_imp=ANT_IMP):
+    """Build SPICE netlist with given parameters (direct connection, no matching)."""
     t_rf = 1.0 / freq
     t_step = t_rf / 40
     t_stop = n_cycles * t_rf
@@ -77,25 +102,25 @@ def build_netlist(freq=F_RF, v_amp=V_RF_AMPLITUDE, c_in=C_IN, c_out=C_OUT,
     script_dir = Path(__file__).parent.absolute()
     model_path = script_dir / DIODE_MODEL_FILE
     
-
-
     ##############Note from Chen: this circuit is the replicate simulation of the RF rectifier in figure 2 of the paper. netlist is checked by Chen
-    netlist = f"""Half-Wave RF Rectifier 
+    netlist = f"""Half-Wave RF Rectifier (Direct - No Matching)
 .include {model_path}
 
+* RF Source with antenna impedance
 Vrf rf_source 0 SIN(0 {v_amp} {freq})
-Rsource rf_source rf_in {R_SOURCE}
+Rant rf_source rf_in {ant_imp}
 
+* Input coupling capacitor with ESR
 Cin rf_in node_c_in {c_in}
 Resr_in node_c_in diode_anode {esr_in}
 
+* Half-wave rectifier diodes
 D2 0 diode_anode {DIODE_MODEL_NAME}
-
 D1 diode_anode vout {DIODE_MODEL_NAME}
 
+* Output filter
 Cout vout node_c_out {c_out}
 Resr_out node_c_out 0 {esr_out}
-
 Rload vout 0 {r_load}
 
 .control
@@ -112,8 +137,88 @@ quit
     return netlist, t_stop, n_cycles, t_step
 
 
+# =============================================================================
+# Netlist Builder - With Pi-Match Network
+# =============================================================================
+
+def build_netlist_with_pi_match(freq=F_RF, v_amp=V_RF_AMPLITUDE, c_in=C_IN, c_out=C_OUT,
+                                 r_load=R_LOAD, n_cycles=N_CYCLES, ant_imp=ANT_IMP,
+                                 pi_match: PiMatchNetwork = None,
+                                 L_val=None, C1_val=None, C2_val=None,
+                                 q_L=IND_Q, q_C=PI_MATCH_CAP_Q):
+    """
+    Build SPICE netlist with Pi-matching network.
+    
+    Can provide either:
+    - pi_match: PiMatchNetwork object, OR
+    - L_val, C1_val, C2_val: Individual component values
+    
+    If neither provided, will use default analytical design.
+    """
+    t_rf = 1.0 / freq
+    t_step = t_rf / 40
+    t_stop = n_cycles * t_rf
+    
+    # ESR for rectifier capacitors
+    esr_in = calculate_esr_from_q(c_in, CAP_Q, freq)
+    esr_out = calculate_esr_from_q(c_out, CAP_Q, freq)
+    
+    # Get or create Pi-match network
+    if pi_match is None:
+        if L_val is not None and C1_val is not None and C2_val is not None:
+            pi_match = create_pi_match_from_values(L_val, C1_val, C2_val, 
+                                                   ant_imp, RECT_IMP_EST, freq, q_L, q_C)
+        else:
+            pi_match = design_pi_match(ant_imp, RECT_IMP_EST, freq, q_L, q_C)
+    
+    # Get Pi-match netlist fragment from the PiMatchNetwork object
+    pi_match_netlist = pi_match.generate_spice_netlist(node_in='ant_out', node_out='pi_out')
+    
+    script_dir = Path(__file__).parent.absolute()
+    model_path = script_dir / DIODE_MODEL_FILE
+    
+    netlist = f"""Half-Wave RF Rectifier with Pi-Matching Network
+.include {model_path}
+
+* Design: {ant_imp} Ohm antenna -> Pi-match -> Rectifier
+
+* RF Source with antenna impedance
+Vrf rf_source 0 SIN(0 {v_amp} {freq})
+Rant rf_source ant_out {ant_imp}
+
+{pi_match_netlist}
+
+* === Half-Wave Rectifier ===
+* Input coupling capacitor with ESR
+Cin pi_out node_c_in {c_in}
+Resr_in node_c_in diode_anode {esr_in}
+
+* Half-wave rectifier diodes
+D2 0 diode_anode {DIODE_MODEL_NAME}
+D1 diode_anode vout {DIODE_MODEL_NAME}
+
+* Output filter
+Cout vout node_c_out {c_out}
+Resr_out node_c_out 0 {esr_out}
+Rload vout 0 {r_load}
+
+.control
+set filetype=ascii
+set wr_vecnames
+option noacct
+tran {t_step} {t_stop} uic
+wrdata output.txt time v(ant_out) v(pi_out) v(vout)
+quit
+.endc
+
+.end
+"""
+    return netlist, t_stop, n_cycles, t_step
+
+
 def build_netlist_with_esr(freq=F_RF, v_amp=V_RF_AMPLITUDE, c_in=C_IN, c_out=C_OUT, 
-                           r_load=R_LOAD, n_cycles=N_CYCLES, esr_in=None, esr_out=None):
+                           r_load=R_LOAD, n_cycles=N_CYCLES, esr_in=None, esr_out=None,
+                           ant_imp=ANT_IMP):
     """
     Build SPICE netlist with explicitly specified ESR values.
     Used for Monte Carlo analysis where ESR varies independently.
@@ -134,19 +239,21 @@ def build_netlist_with_esr(freq=F_RF, v_amp=V_RF_AMPLITUDE, c_in=C_IN, c_out=C_O
     netlist = f"""Half-Wave RF Rectifier (ESR specified)
 .include {model_path}
 
+* RF Source with antenna impedance
 Vrf rf_source 0 SIN(0 {v_amp} {freq})
-Rsource rf_source rf_in {R_SOURCE}
+Rant rf_source rf_in {ant_imp}
 
+* Input coupling capacitor with ESR
 Cin rf_in node_c_in {c_in}
 Resr_in node_c_in diode_anode {esr_in}
 
+* Half-wave rectifier diodes
 D2 0 diode_anode {DIODE_MODEL_NAME}
-
 D1 diode_anode vout {DIODE_MODEL_NAME}
 
+* Output filter
 Cout vout node_c_out {c_out}
 Resr_out node_c_out 0 {esr_out}
-
 Rload vout 0 {r_load}
 
 .control
@@ -164,13 +271,55 @@ quit
 
 
 # =============================================================================
-# Analysis 1: Transient + Harmonic Analysis
+# Analysis 0: Pi-Match Optimization (Run First)
+# =============================================================================
+
+def run_pi_match_optimization(verbose=True):
+    """
+    Run Pi-match optimization to find optimal L, C1, C2 values.
+    
+    Constraints:
+    - Return loss < -20 dB at center frequency
+    - Bandwidth > 30 MHz centered at 2.45 GHz
+    - Uses non-ideal components with Q factors
+    
+    Returns:
+        OptimizationResult with optimal Pi-match network
+    """
+    print("\n" + "="*60)
+    print("ANALYSIS 0: PI-MATCH OPTIMIZATION")
+    print("="*60)
+    print(f"Source (antenna): {ANT_IMP} Ω")
+    print(f"Load (rectifier): {RECT_IMP_EST} Ω (estimated)")
+    print(f"Center frequency: {F_RF/1e9:.3f} GHz")
+    print(f"Target return loss: < {PI_MATCH_TARGET_RL_DB} dB")
+    print(f"Target bandwidth: > {PI_MATCH_TARGET_BW_MHZ} MHz")
+    print(f"Component Q: L={IND_Q}, C={PI_MATCH_CAP_Q}")
+    print("-"*60)
+    
+    result = optimize_pi_match(
+        z_source=ANT_IMP,
+        z_load=RECT_IMP_EST,
+        f_center=F_RF,
+        q_L=IND_Q,
+        q_C=PI_MATCH_CAP_Q,
+        target_rl_dB=PI_MATCH_TARGET_RL_DB,
+        target_bw_MHz=PI_MATCH_TARGET_BW_MHZ,
+        method='auto',
+        verbose=verbose
+    )
+    
+    return result
+
+
+# =============================================================================
+# Analysis 1: Transient + Harmonic Analysis (Direct - No Matching)
 # =============================================================================
 
 def run_transient_and_harmonic():
-    """Run transient simulation and harmonic analysis."""
+    """Run transient simulation and harmonic analysis (direct, no matching)."""
     print("\n" + "="*60)
-    print("ANALYSIS 1: TRANSIENT + HARMONIC ANALYSIS")
+    print("ANALYSIS 1: TRANSIENT + HARMONIC ANALYSIS (Direct)")
     print("="*60)
     
     netlist, t_stop, n_cycles, t_step = build_netlist()
@@ -431,39 +580,135 @@ def run_monte_carlo(n_runs=50):
 
 
 # =============================================================================
+# Analysis 5: Matched Rectifier Comparison
+# =============================================================================
 
-if __name__ == "__main__":
-    print("="*60)
-    print("HALF-WAVE RF RECTIFIER - FULL ANALYSIS SUITE")
-    print(f"Target: {F_RF/1e9:.2f} GHz | Input: {V_RF_AMPLITUDE*1000:.0f} mV pk | R_load: {R_LOAD/1e3:.0f} kΩ")
+def run_matched_rectifier_comparison(pi_match_result: OptimizationResult = None):
+    """
+    Compare rectifier performance with and without Pi-matching network.
+    
+    Args:
+        pi_match_result: Optimization result from run_pi_match_optimization()
+                        If None, will run optimization first.
+    
+    Returns:
+        Dict with comparison results
+    """
+    print("\n" + "="*60)
+    print("ANALYSIS 5: MATCHED vs DIRECT RECTIFIER COMPARISON")
     print("="*60)
     
-    # 0. Plot WiFi input spectrum (using CommPy 802.11 OFDM - realistic spectrum)
+    # Get optimized Pi-match if not provided
+    if pi_match_result is None:
+        print("Running Pi-match optimization first...")
+        pi_match_result = run_pi_match_optimization(verbose=False)
+    
+    pi_match = pi_match_result.pi_match
+    
+    print(f"\nPi-Match Network:")
+    print(f"  L  = {pi_match.L.L*1e9:.4f} nH (Q={pi_match.L.Q})")
+    print(f"  C1 = {pi_match.C1.C*1e12:.4f} pF (Q={pi_match.C1.Q})")
+    print(f"  C2 = {pi_match.C2.C*1e12:.4f} pF (Q={pi_match.C2.Q})")
+    print(f"  Return Loss: {pi_match_result.return_loss_dB:.2f} dB")
+    print(f"  Bandwidth:   {pi_match_result.bandwidth_MHz:.1f} MHz")
+    
+    # Simulate direct (no matching)
+    print("\nSimulating direct connection (no matching)...")
+    netlist_direct, t_stop, n_cyc, t_step = build_netlist()
+    data_direct = run_halfwave_simulation(netlist_direct, t_stop, n_cyc, t_step)
+    metrics_direct = extract_dc_metrics(data_direct, R_LOAD)
+    
+    # Simulate with Pi-match
+    print("Simulating with Pi-matching network...")
+    netlist_matched, t_stop, n_cyc, t_step = build_netlist_with_pi_match(
+        pi_match=pi_match
+    )
+    data_matched = run_matched_rectifier_simulation(netlist_matched, t_stop, n_cyc, t_step)
+    metrics_matched = extract_dc_metrics(data_matched, R_LOAD)
+    
+    # Calculate improvement
+    if metrics_direct['v_dc'] > 0:
+        v_improvement = (metrics_matched['v_dc'] / metrics_direct['v_dc'] - 1) * 100
+        p_improvement = (metrics_matched['p_out'] / metrics_direct['p_out'] - 1) * 100
+    else:
+        v_improvement = float('inf')
+        p_improvement = float('inf')
+    
+    print("\n" + "-"*60)
+    print("RESULTS COMPARISON")
+    print("-"*60)
+    print(f"{'Metric':<20} {'Direct':>15} {'Matched':>15} {'Improvement':>15}")
+    print("-"*60)
+    print(f"{'V_DC (mV)':<20} {metrics_direct['v_dc']*1000:>15.3f} {metrics_matched['v_dc']*1000:>15.3f} {v_improvement:>+14.1f}%")
+    print(f"{'Ripple (mV)':<20} {metrics_direct['ripple']*1000:>15.3f} {metrics_matched['ripple']*1000:>15.3f}")
+    print(f"{'Power (uW)':<20} {metrics_direct['p_out']*1e6:>15.3f} {metrics_matched['p_out']*1e6:>15.3f} {p_improvement:>+14.1f}%")
+    print("-"*60)
+    
+    # Plot comparison
+    plot_matched_rectifier_results(
+        data_direct, data_matched, 
+        metrics_direct, metrics_matched,
+        F_RF, V_RF_AMPLITUDE, R_LOAD,
+        save_prefix='matched_rectifier_comparison'
+    )
+    
+    return {
+        'direct': {'data': data_direct, 'metrics': metrics_direct},
+        'matched': {'data': data_matched, 'metrics': metrics_matched},
+        'v_improvement_pct': v_improvement,
+        'p_improvement_pct': p_improvement,
+        'pi_match': pi_match
+    }
+
+
+# =============================================================================
+
+if __name__ == "__main__":
+    print("="*70)
+    print("HALF-WAVE RF RECTIFIER - FULL ANALYSIS SUITE (with Pi-Match)")
+    print(f"Target: {F_RF/1e9:.2f} GHz | Input: {V_RF_AMPLITUDE*1000:.0f} mV pk | R_load: {R_LOAD/1e3:.0f} kΩ")
+    print(f"Antenna Impedance: {ANT_IMP} Ω")
+    print("="*70)
+    
+    # 0a. Plot WiFi input spectrum (using CommPy 802.11 OFDM - realistic spectrum)
     print("\nGenerating WiFi OFDM input spectrum (CommPy)...")
     plot_wifi_spectrum_commpy(V_RF_AMPLITUDE, F_RF, n_symbols=10, mcs=3)  # MCS3 = 16-QAM
     
-    # 1. Transient + Harmonic
+    # 0b. Run Pi-Match Optimization
+    pi_opt_result = run_pi_match_optimization(verbose=True)
+    
+    # 1. Transient + Harmonic (Direct - no matching)
     trans_data, harm_data = run_transient_and_harmonic()
     
-    # 2. Sensitivity Analysis (combined plot: input amplitude + Cout)
+    # 2. Matched vs Direct Comparison
+    comparison_results = run_matched_rectifier_comparison(pi_opt_result)
+    
+    # 3. Sensitivity Analysis (combined plot: input amplitude + Cout)
     sens_v, sens_c = run_sensitivity_analysis()
     
-    # 3. Frequency Stability (narrowband +/-20 MHz with WiFi BW consideration)
+    # 4. Frequency Stability (narrowband +/-20 MHz with WiFi BW consideration)
     freq_stab_data, bw_3db = run_frequency_stability()
     
-    # 4. Monte Carlo (with ESR variation for PCB/solder effects)
+    # 5. Monte Carlo (with ESR variation for PCB/solder effects)
     mc_data, mc_stats = run_monte_carlo(n_runs=50)
     
-    print("\n" + "="*60)
+    print("\n" + "="*70)
     print("ALL ANALYSES COMPLETE")
-    print("="*60)
-    print("Generated plots in temp_image/:")
+    print("="*70)
+    print("\nGenerated plots in temp_image/:")
     print("  - wifi_spectrum.png")
     print("  - halfwave_transient_waveforms.png")
     print("  - halfwave_harmonics_spectrum.png")
     print("  - halfwave_harmonics_harmonics.png")
+    print("  - matched_rectifier_comparison.png  [NEW]")
     print("  - halfwave_sens_combined.png")
     print("  - halfwave_freq_stability.png")
     print("  - halfwave_mc_dc.png")
     print("  - halfwave_mc_ripple.png")
     print("  - halfwave_mc_power.png")
+    
+    print("\nPi-Match Network Summary:")
+    print(f"  L  = {pi_opt_result.L*1e9:.4f} nH")
+    print(f"  C1 = {pi_opt_result.C1*1e12:.4f} pF")
+    print(f"  C2 = {pi_opt_result.C2*1e12:.4f} pF")
+    print(f"  Performance: RL={pi_opt_result.return_loss_dB:.1f}dB, BW={pi_opt_result.bandwidth_MHz:.1f}MHz")

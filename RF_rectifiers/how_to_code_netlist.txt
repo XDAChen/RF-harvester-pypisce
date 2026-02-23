@@ -20,6 +20,7 @@ Component definitions...
 |-----------|--------|---------|
 | Resistor | Rname n1 n2 value | Rload vout 0 5k |
 | Capacitor | Cname n1 n2 value | Cout vout 0 100p |
+| Inductor | Lname n1 n2 value | L_pi ant_out pi_out 1n |
 | Diode | Dname anode cathode MODEL | D1 in vout SMS7630 |
 | Voltage | Vname n+ n- TYPE(params) | Vrf in 0 SIN(0 0.3 2.45e9) |
 | Include | .include path | .include diode_models.lib |
@@ -50,6 +51,41 @@ quit
 
 tran syntax: `tran step stop [start] [uic]`
 
+## Pi-Matching Network (Low-Pass)
+
+Topology:
+```
+                L (series)
+            ┌────LLLL────RL────┐
+            │                  │
+IN o────────┼──────────────────┼────────o OUT
+            │                  │
+           ═══ C1             ═══ C2
+            │                  │
+           GND                GND
+```
+
+SPICE netlist (with ESR for non-ideal components):
+```
+* Input shunt capacitor C1 with ESR
+C_pi1 ant_out pi_c1_esr {C1}
+R_pi1_esr pi_c1_esr 0 {esr_C1}
+* Series inductor L with ESR
+L_pi ant_out pi_L_out {L}
+R_pi_L_esr pi_L_out pi_out {esr_L}
+* Output shunt capacitor C2 with ESR
+C_pi2 pi_out pi_c2_esr {C2}
+R_pi2_esr pi_c2_esr 0 {esr_C2}
+```
+
+Using pi_match.py module:
+```python
+from pi_match import design_pi_match
+
+pi_match = design_pi_match(z_source=50, z_load=30, f_center=2.45e9)
+netlist_fragment = pi_match.generate_spice_netlist(node_in='ant_out', node_out='pi_out')
+```
+
 ## Example Function
 
 ```python
@@ -78,11 +114,16 @@ quit
 ## Using Build Functions
 
 ```python
-from halfwave_rectifier import build_netlist
-from utility import run_halfwave_simulation
+from halfwave_rectifier import build_netlist, build_netlist_with_pi_match
+from utility import run_halfwave_simulation, run_matched_rectifier_simulation
 
+# Direct (no matching)
 netlist, t_stop, n_cyc, t_step = build_netlist()
 data = run_halfwave_simulation(netlist, t_stop, n_cyc, t_step)
+
+# With Pi-match
+netlist, t_stop, n_cyc, t_step = build_netlist_with_pi_match()
+data = run_matched_rectifier_simulation(netlist, t_stop, n_cyc, t_step)
 ```
 
 ## Tips
@@ -91,3 +132,4 @@ data = run_halfwave_simulation(netlist, t_stop, n_cyc, t_step)
 - Use f-strings for parameter insertion
 - wrdata signals must match what run_*_simulation() parses
 - Comments with * help document circuit sections
+- ESR = 1/(omega*C*Q) for capacitors, ESR = omega*L/Q for inductors

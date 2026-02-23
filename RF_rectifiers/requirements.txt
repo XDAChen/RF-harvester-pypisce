@@ -12,3 +12,4 @@ matplotlib==3.10.8
 PySpice==1.5
 scipy==1.17.0
 scikit-commpy==0.8.0  # WiFi 802.11 OFDM signal generation
+optuna>=3.0.0         # Advanced optimization (TPE, multi-objective)

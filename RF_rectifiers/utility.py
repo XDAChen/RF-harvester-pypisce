@@ -578,6 +578,40 @@ def calculate_esr_from_q(capacitance, q_factor, frequency):
     return 1.0 / (2 * np.pi * frequency * capacitance * q_factor)
 
 
+def estimate_rectifier_input_impedance(v_rf_amplitude: float, r_load: float,
+                                        diode_is: float = 5e-6, 
+                                        diode_n: float = 1.05) -> complex:
+    """
+    Estimate the input impedance of a half-wave rectifier.
+    
+    This is a simplified model - actual impedance is nonlinear and 
+    depends on operating point.
+    
+    Args:
+        v_rf_amplitude: RF input amplitude (V)
+        r_load: Load resistance (Ohms)
+        diode_is: Diode saturation current
+        diode_n: Diode ideality factor
+    
+    Returns:
+        Estimated complex impedance (mostly resistive for rectifier)
+    """
+    Vt = 0.026  # Thermal voltage
+    
+    # Approximate DC output
+    V_dc = v_rf_amplitude * 0.9 - 0.3  # Rough estimate with diode drop
+    V_dc = max(V_dc, 0.01)
+    
+    # Approximate input resistance (rectifier looks resistive at fundamental)
+    # Using simplified analysis from rectifier theory
+    R_in = v_rf_amplitude**2 / (2 * V_dc**2 / r_load + 1e-9)
+    R_in = min(R_in, 1000)  # Practical limit
+    R_in = max(R_in, 10)
+    
+    # Small reactive component from junction capacitance (simplified)
+    return complex(R_in, -5)  # Slightly capacitive
+
+
 # =============================================================================
 # Harmonic Analysis
 # =============================================================================
@@ -1084,6 +1118,24 @@ def run_halfwave_simulation(netlist, t_stop, n_cycles, t_step):
     return {'time': data['time'], 'rf_in': data['signal_0'], 'vout': data['signal_1']}
 
 
+def run_matched_rectifier_simulation(netlist, t_stop, n_cycles, t_step):
+    """
+    Run matched rectifier simulation (3 signals: ant_out, pi_out, vout).
+    
+    For netlists with Pi-matching network that output:
+    - v(ant_out): Voltage at antenna output / Pi-match input
+    - v(pi_out): Voltage at Pi-match output / rectifier input
+    - v(vout): DC output voltage
+    """
+    data = run_transient_ngspice(netlist, t_stop, n_cycles, t_step, num_signals=3)
+    return {
+        'time': data['time'],
+        'ant_out': data['signal_0'],
+        'pi_out': data['signal_1'],
+        'vout': data['signal_2']
+    }
+
+
 def run_dickson_simulation(netlist, t_stop, n_cycles, t_step):
     """Run Dickson simulation (4 signals)."""
     data = run_transient_ngspice(netlist, t_stop, n_cycles, t_step, num_signals=4)
@@ -1224,6 +1276,124 @@ def plot_dickson_results(data, n_stages, f_rf, v_rf_amplitude, r_load,
     plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
     print(f"[INFO] Saved '{save_path}'")
     plt.show()
+
+
+def plot_matched_rectifier_results(data_direct, data_matched, 
+                                    metrics_direct, metrics_matched,
+                                    f_rf, v_rf_amplitude, r_load,
+                                    save_prefix='matched_rectifier_comparison'):
+    """
+    Plot comparison of direct vs matched rectifier results (publication style).
+    
+    Args:
+        data_direct: Simulation data dict for direct connection
+        data_matched: Simulation data dict for matched connection  
+        metrics_direct: Extracted metrics for direct
+        metrics_matched: Extracted metrics for matched
+        f_rf: RF frequency (Hz)
+        v_rf_amplitude: RF amplitude (V)
+        r_load: Load resistance (Ohm)
+        save_prefix: Output filename prefix
+    """
+    apply_pub_style()
+    
+    # Time in ns
+    time_direct = data_direct['time'] * 1e9
+    time_matched = data_matched['time'] * 1e9
+    
+    # Create figure with 2 subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 12))
+    
+    # === Plot 1: DC Output Comparison ===
+    ax1.plot(time_direct, data_direct['vout'] * 1000, 'k-', lw=2, 
+             label=f'Direct (V_DC={metrics_direct["v_dc"]*1000:.2f}mV)')
+    ax1.plot(time_matched, data_matched['vout'] * 1000, 'k--', lw=2,
+             label=f'Matched (V_DC={metrics_matched["v_dc"]*1000:.2f}mV)')
+    
+    # DC reference lines  
+    ax1.axhline(metrics_direct['v_dc'] * 1000, color='gray', ls=':', lw=1.5, alpha=0.7)
+    ax1.axhline(metrics_matched['v_dc'] * 1000, color='gray', ls=':', lw=1.5, alpha=0.7)
+    
+    ax1.set_xlabel('Time (ns)')
+    ax1.set_ylabel('DC Output (mV)')
+    ax1.legend(loc='lower right', fontsize=18)
+    
+    # Calculate improvement
+    if metrics_direct['v_dc'] > 0:
+        improvement = (metrics_matched['v_dc'] / metrics_direct['v_dc'] - 1) * 100
+        ax1.text(0.02, 0.95, f'Improvement: +{improvement:.1f}%', 
+                 transform=ax1.transAxes, fontsize=18, fontweight='bold',
+                 va='top', bbox=dict(boxstyle='round', facecolor='white', edgecolor='black'))
+    
+    for spine in ax1.spines.values():
+        spine.set_linewidth(2)
+    ax1.locator_params(axis='x', nbins=6)
+    ax1.locator_params(axis='y', nbins=5)
+    
+    # === Plot 2: Pi-Match Output vs Direct Input (RF signals) ===
+    # Show last ~20 RF cycles for clarity
+    n_show = min(800, len(time_matched) // 5)  # Last portion
+    
+    ax2.plot(time_direct[-n_show:], data_direct['rf_in'][-n_show:] * 1000, 
+             'k-', lw=1.5, alpha=0.7, label='Direct: RF Input')
+    
+    if 'pi_out' in data_matched:
+        ax2.plot(time_matched[-n_show:], data_matched['pi_out'][-n_show:] * 1000,
+                 'k--', lw=1.5, alpha=0.9, label='Matched: Pi-Match Output')
+    
+    ax2.set_xlabel('Time (ns)')
+    ax2.set_ylabel('RF Voltage (mV)')
+    ax2.legend(loc='upper right', fontsize=16)
+    
+    for spine in ax2.spines.values():
+        spine.set_linewidth(2)
+    ax2.locator_params(axis='x', nbins=6)
+    ax2.locator_params(axis='y', nbins=5)
+    
+    plt.tight_layout()
+    save_path = get_save_path(f'{save_prefix}.png')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path}'")
+    plt.show()
+    
+    # Also create a summary bar chart
+    fig2, ax3 = plt.subplots(figsize=(10, 8))
+    
+    categories = ['V_DC (mV)', 'Power (µW)']
+    direct_vals = [metrics_direct['v_dc'] * 1000, metrics_direct['p_out'] * 1e6]
+    matched_vals = [metrics_matched['v_dc'] * 1000, metrics_matched['p_out'] * 1e6]
+    
+    x = np.arange(len(categories))
+    width = 0.35
+    
+    bars1 = ax3.bar(x - width/2, direct_vals, width, label='Direct', 
+                    color='white', edgecolor='black', linewidth=2, hatch='///')
+    bars2 = ax3.bar(x + width/2, matched_vals, width, label='With Pi-Match',
+                    color='white', edgecolor='black', linewidth=2, hatch='...')
+    
+    ax3.set_ylabel('Value')
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(categories)
+    ax3.legend(loc='upper left', fontsize=18)
+    
+    # Add value labels on bars
+    for bar, val in zip(bars1, direct_vals):
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(direct_vals)*0.02,
+                 f'{val:.2f}', ha='center', va='bottom', fontsize=14, fontweight='bold')
+    for bar, val in zip(bars2, matched_vals):
+        ax3.text(bar.get_x() + bar.get_width()/2, bar.get_height() + max(matched_vals)*0.02,
+                 f'{val:.2f}', ha='center', va='bottom', fontsize=14, fontweight='bold')
+    
+    for spine in ax3.spines.values():
+        spine.set_linewidth(2)
+    
+    plt.tight_layout()
+    save_path2 = get_save_path(f'{save_prefix}_bar.png')
+    plt.savefig(save_path2, dpi=300, bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved '{save_path2}'")
+    plt.show()
+    
+    return fig, fig2
 
 
 # =============================================================================
