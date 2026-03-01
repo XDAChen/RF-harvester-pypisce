@@ -97,10 +97,7 @@ class PiMatchNetwork:
     """
     Pi-Matching Network with non-ideal components.
     
-    Topology:
-        IN ──┬── C1 ──┬── L ──┬── C2 ──┬── OUT
-             │        │       │        │
-            GND      GND     GND      GND
+
     
     Attributes:
         L: Inductor object (series element)

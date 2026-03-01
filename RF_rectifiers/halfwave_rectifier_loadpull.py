@@ -2,6 +2,7 @@
 """
 ================================================================================
 Half-Wave RF Rectifier - Full Analysis Suite at 2.437 GHz (WiFi Ch 6)
+WITH LOAD-PULL OPTIMIZATION
 ================================================================================
 RF energy harvesting rectifier with:
     1. Transient simulation (with/without Pi-match)
@@ -9,6 +10,12 @@ RF energy harvesting rectifier with:
     3. Frequency sweep
     4. Sensitivity / Monte Carlo analysis
     5. Pi-match network optimization integration
+    6. **NEW: Load-Pull Optimization (maximize DC power directly)**
+
+The load-pull optimization sweeps Pi-match values (L, C1, C2), runs full
+SPICE simulations with the diode model, and finds values that maximize
+DC output power. This is the proper approach for nonlinear rectifier
+optimization - we don't assume a fixed rectifier impedance.
 
 Author: RF Energy Harvesting Team
 Date: 2026
@@ -43,7 +50,12 @@ from pi_match import (
     PiMatchNetwork, Inductor, Capacitor,
     create_pi_match_from_values, design_pi_match
 )
-from optimization import optimize_pi_match, OptimizationResult
+from optimization import (
+    optimize_pi_match, OptimizationResult,
+    optimize_pi_match_load_pull, LoadPullResult,
+    optimize_pi_match_load_pull_vs_power, LoadPullSweepResult,
+    plot_load_pull_results, plot_load_pull_vs_power
+)
 
 
 # =============================================================================
@@ -308,6 +320,157 @@ def run_pi_match_optimization(verbose=True):
         method='auto',
         verbose=verbose
     )
+    
+    return result
+
+
+# =============================================================================
+# Analysis 0b: LOAD-PULL OPTIMIZATION (Maximize DC Power Directly)
+# =============================================================================
+
+def run_load_pull_optimization(n_points=8, verbose=True):
+    """
+    Run load-pull optimization to maximize DC output power.
+    
+    Unlike traditional S-parameter optimization (which assumes a fixed/estimated
+    rectifier impedance), this method:
+    
+    1. Sweeps Pi-match component values (L, C1, C2)
+    2. For EACH combination, runs a FULL SPICE simulation with diode model
+    3. Measures the actual DC output power
+    4. Finds the values that MAXIMIZE P_out
+    5. At max power, extracts the effective impedance
+    
+    This is the proper approach for nonlinear rectifier optimization because
+    the rectifier impedance is not a fixed value - it depends on operating
+    conditions and is determined by the diode model.
+    
+    Args:
+        n_points: Grid points per dimension (total sims = n_points³)
+        verbose: Print progress
+    
+    Returns:
+        LoadPullResult with optimal Pi-match values and effective impedance
+    """
+    print("\n" + "="*60)
+    print("ANALYSIS 0b: LOAD-PULL OPTIMIZATION")
+    print("(Maximize DC Power via Full SPICE Simulation)")
+    print("="*60)
+    print(f"This approach does NOT assume a fixed rectifier impedance.")
+    print(f"Instead, we find Pi-match values that maximize P_out directly.")
+    print("-"*60)
+    
+    result = optimize_pi_match_load_pull(
+        freq=F_RF,
+        v_amp=V_RF_AMPLITUDE,
+        r_load=R_LOAD,
+        c_in=C_IN,
+        c_out=C_OUT,
+        ant_imp=ANT_IMP,
+        q_L=IND_Q,
+        q_C=PI_MATCH_CAP_Q,
+        cap_q=CAP_Q,
+        n_cycles=N_CYCLES,
+        diode_model_name=DIODE_MODEL_NAME,
+        diode_model_file=DIODE_MODEL_FILE,
+        n_points=n_points,
+        refine=True,
+        verbose=verbose
+    )
+    
+    # Plot the load-pull results
+    if result.success:
+        plot_load_pull_results(
+            result,
+            save_path=get_save_path('load_pull_optimization.png'),
+            show=False
+        )
+        
+        print("\n" + "-"*60)
+        print("COMPARISON: Estimated vs Optimized Impedance")
+        print("-"*60)
+        print(f"  Original estimate:    Z_rect = {RECT_IMP_EST} Ω (assumed)")
+        print(f"  Effective Z at max P: Z_eff  = {abs(result.effective_z_in):.2f} Ω")
+        print(f"                        Phase  = {np.angle(result.effective_z_in, deg=True):.1f}°")
+        print("-"*60)
+    
+    return result
+
+
+# =============================================================================
+# Analysis 0c: FULL LOAD-PULL vs INPUT POWER (Nonlinear Characterization)
+# =============================================================================
+
+def run_load_pull_vs_power(n_points=5, p_dBm_list=None, verbose=True):
+    """
+    Run FULL load-pull characterization across multiple input power levels.
+    
+    This is the proper load-pull approach that reveals the nonlinear nature
+    of the rectifier:
+    
+    1. Outer loop: Sweep input power (P_in = -30dBm, -20dBm, -10dBm, ...)
+    2. Inner loop: For each power, sweep Pi-match values (L, C1, C2)
+    3. Find optimal matching at EACH power level
+    4. Show how optimal component values VARY with input power
+    
+    This tells you:
+    - Whether a single matching network works across your expected power range
+    - How much the optimal matching shifts with power (nonlinearity measure)
+    - If you need adaptive matching for wide dynamic range
+    
+    Args:
+        n_points: Grid points per dimension per power level
+        p_dBm_list: List of input powers (dBm), or None for default
+        verbose: Print progress
+    
+    Returns:
+        LoadPullSweepResult with optimal values at each power level
+    """
+    print("\n" + "="*70)
+    print("ANALYSIS 0c: FULL LOAD-PULL CHARACTERIZATION vs INPUT POWER")
+    print("="*70)
+    print(f"This characterization reveals how optimal matching VARIES with power.")
+    print(f"Key insight: Nonlinear rectifier -> optimal matching changes with input level!")
+    print("-"*70)
+    
+    # Default power levels: typical RF harvesting range
+    if p_dBm_list is None:
+        p_dBm_list = [-30, -25, -20, -15, -10, -5, 0]  # dBm
+    
+    result = optimize_pi_match_load_pull_vs_power(
+        freq=F_RF,
+        p_dBm_list=p_dBm_list,
+        r_load=R_LOAD,
+        c_in=C_IN,
+        c_out=C_OUT,
+        ant_imp=ANT_IMP,
+        q_L=IND_Q,
+        q_C=PI_MATCH_CAP_Q,
+        cap_q=CAP_Q,
+        n_cycles=N_CYCLES,
+        diode_model_name=DIODE_MODEL_NAME,
+        diode_model_file=DIODE_MODEL_FILE,
+        n_points=n_points,
+        verbose=verbose
+    )
+    
+    # Plot the power sweep results
+    if result.success:
+        plot_load_pull_vs_power(
+            result,
+            save_dir='temp_image',
+            show=False
+        )
+        
+        # Calculate component variation
+        L_vals = [L for L in result.optimal_L_vs_power if not np.isnan(L)]
+        if len(L_vals) > 1:
+            L_variation = (max(L_vals) - min(L_vals)) / np.mean(L_vals) * 100
+            print(f"\n  Inductance variation across power: {L_variation:.1f}%")
+            if L_variation > 30:
+                print(f"  WARNING: Large variation - may need adaptive matching!")
+            else:
+                print(f"  Moderate variation - fixed matching may work across this range.")
     
     return result
 
@@ -583,13 +746,15 @@ def run_monte_carlo(n_runs=50):
 # Analysis 5: Matched Rectifier Comparison
 # =============================================================================
 
-def run_matched_rectifier_comparison(pi_match_result: OptimizationResult = None):
+def run_matched_rectifier_comparison(pi_match_result = None):
     """
     Compare rectifier performance with and without Pi-matching network.
     
     Args:
-        pi_match_result: Optimization result from run_pi_match_optimization()
-                        If None, will run optimization first.
+        pi_match_result: Optimization result - can be either:
+                        - OptimizationResult from S-parameter optimization
+                        - LoadPullResult from load-pull optimization
+                        If None, will run S-parameter optimization first.
     
     Returns:
         Dict with comparison results
@@ -609,8 +774,15 @@ def run_matched_rectifier_comparison(pi_match_result: OptimizationResult = None)
     print(f"  L  = {pi_match.L.L*1e9:.4f} nH (Q={pi_match.L.Q})")
     print(f"  C1 = {pi_match.C1.C*1e12:.4f} pF (Q={pi_match.C1.Q})")
     print(f"  C2 = {pi_match.C2.C*1e12:.4f} pF (Q={pi_match.C2.Q})")
-    print(f"  Return Loss: {pi_match_result.return_loss_dB:.2f} dB")
-    print(f"  Bandwidth:   {pi_match_result.bandwidth_MHz:.1f} MHz")
+    
+    # Print method-specific info
+    if hasattr(pi_match_result, 'return_loss_dB'):  # S-parameter OptimizationResult
+        print(f"  Return Loss: {pi_match_result.return_loss_dB:.2f} dB")
+        print(f"  Bandwidth:   {pi_match_result.bandwidth_MHz:.1f} MHz")
+    elif hasattr(pi_match_result, 'max_power_mW'):  # LoadPullResult
+        print(f"  (Optimized for max power: {pi_match_result.max_power_mW*1000:.2f} µW)")
+        print(f"  Effective Z_in: {abs(pi_match_result.effective_z_in):.2f} Ω "
+              f"∠{np.angle(pi_match_result.effective_z_in, deg=True):.1f}°")
     
     # Simulate direct (no matching)
     print("\nSimulating direct connection (no matching)...")
@@ -665,8 +837,9 @@ def run_matched_rectifier_comparison(pi_match_result: OptimizationResult = None)
 
 if __name__ == "__main__":
     print("="*70)
-    print("HALF-WAVE RF RECTIFIER - FULL ANALYSIS SUITE (with Pi-Match)")
-    print(f"Target: {F_RF/1e9:.2f} GHz | Input: {V_RF_AMPLITUDE*1000:.0f} mV pk | R_load: {R_LOAD/1e3:.0f} kΩ")
+    print("HALF-WAVE RF RECTIFIER - FULL ANALYSIS SUITE (with Load-Pull)")
+    print(f"Target: {F_RF/1e9:.3f} GHz (WiFi Ch 6)")
+    print(f"Input: {V_RF_AMPLITUDE*1000:.0f} mV pk | R_load: {R_LOAD/1e3:.0f} kΩ")
     print(f"Antenna Impedance: {ANT_IMP} Ω")
     print("="*70)
     
@@ -674,14 +847,50 @@ if __name__ == "__main__":
     print("\nGenerating WiFi OFDM input spectrum (CommPy)...")
     plot_wifi_spectrum_commpy(V_RF_AMPLITUDE, F_RF, n_symbols=10, mcs=3)  # MCS3 = 16-QAM
     
-    # 0b. Run Pi-Match Optimization
+    # 0b. Run traditional Pi-Match Optimization (S-parameter based, assumes Z_rect)
+    print("\n" + "="*70)
+    print("METHOD 1: TRADITIONAL S-PARAMETER OPTIMIZATION")
+    print("(Assumes fixed rectifier impedance estimate)")
+    print("="*70)
     pi_opt_result = run_pi_match_optimization(verbose=True)
+    
+    # 0c. **NEW** Run Load-Pull Optimization (maximizes DC power directly)
+    print("\n" + "="*70)
+    print("METHOD 2: LOAD-PULL OPTIMIZATION (RECOMMENDED)")
+    print("(Maximizes DC power via full SPICE simulation)")
+    print("="*70)
+    # Use n_points=8 for reasonable runtime (8³ = 512 simulations)
+    load_pull_result = run_load_pull_optimization(n_points=8, verbose=True)
+    
+    # Compare the two methods
+    print("\n" + "="*70)
+    print("COMPARISON: S-Parameter vs Load-Pull Optimization")
+    print("="*70)
+    if load_pull_result.success:
+        print(f"\nS-Parameter Method (assumes Z_rect = {RECT_IMP_EST} Ω):")
+        print(f"  L  = {pi_opt_result.L*1e9:.4f} nH")
+        print(f"  C1 = {pi_opt_result.C1*1e12:.4f} pF")
+        print(f"  C2 = {pi_opt_result.C2*1e12:.4f} pF")
+        print(f"  Return Loss: {pi_opt_result.return_loss_dB:.2f} dB")
+        
+        print(f"\nLoad-Pull Method (empirically finds max P_out):")
+        print(f"  L  = {load_pull_result.L*1e9:.4f} nH")
+        print(f"  C1 = {load_pull_result.C1*1e12:.4f} pF")
+        print(f"  C2 = {load_pull_result.C2*1e12:.4f} pF")
+        print(f"  Max P_out: {load_pull_result.max_power_mW*1000:.2f} µW")
+        print(f"  Effective Z_in: {abs(load_pull_result.effective_z_in):.2f} Ω "
+              f"∠{np.angle(load_pull_result.effective_z_in, deg=True):.1f}°")
     
     # 1. Transient + Harmonic (Direct - no matching)
     trans_data, harm_data = run_transient_and_harmonic()
     
-    # 2. Matched vs Direct Comparison
-    comparison_results = run_matched_rectifier_comparison(pi_opt_result)
+    # 2. Matched vs Direct Comparison (using load-pull optimal values if available)
+    if load_pull_result.success:
+        print("\nUsing LOAD-PULL optimized values for comparison...")
+        comparison_results = run_matched_rectifier_comparison(load_pull_result)
+    else:
+        print("\nUsing S-parameter optimized values for comparison...")
+        comparison_results = run_matched_rectifier_comparison(pi_opt_result)
     
     # 3. Sensitivity Analysis (combined plot: input amplitude + Cout)
     sens_v, sens_c = run_sensitivity_analysis()
@@ -697,18 +906,72 @@ if __name__ == "__main__":
     print("="*70)
     print("\nGenerated plots in temp_image/:")
     print("  - wifi_spectrum.png")
+    print("  - load_pull_optimization.png  [NEW - Load-Pull Results]")
     print("  - halfwave_transient_waveforms.png")
     print("  - halfwave_harmonics_spectrum.png")
     print("  - halfwave_harmonics_harmonics.png")
-    print("  - matched_rectifier_comparison.png  [NEW]")
+    print("  - matched_rectifier_comparison.png")
     print("  - halfwave_sens_combined.png")
     print("  - halfwave_freq_stability.png")
     print("  - halfwave_mc_dc.png")
     print("  - halfwave_mc_ripple.png")
     print("  - halfwave_mc_power.png")
     
-    print("\nPi-Match Network Summary:")
-    print(f"  L  = {pi_opt_result.L*1e9:.4f} nH")
-    print(f"  C1 = {pi_opt_result.C1*1e12:.4f} pF")
-    print(f"  C2 = {pi_opt_result.C2*1e12:.4f} pF")
-    print(f"  Performance: RL={pi_opt_result.return_loss_dB:.1f}dB, BW={pi_opt_result.bandwidth_MHz:.1f}MHz")
+    print("\n" + "="*70)
+    print("FINAL RECOMMENDED Pi-Match VALUES (from Load-Pull):")
+    print("="*70)
+    if load_pull_result.success:
+        print(f"  L  = {load_pull_result.L*1e9:.4f} nH")
+        print(f"  C1 = {load_pull_result.C1*1e12:.4f} pF")
+        print(f"  C2 = {load_pull_result.C2*1e12:.4f} pF")
+        print(f"\n  Maximum DC Power: {load_pull_result.max_power_mW*1000:.2f} µW")
+        print(f"  DC Voltage: {load_pull_result.v_dc_at_max*1000:.2f} mV")
+        print(f"  Efficiency: {load_pull_result.efficiency_percent:.2f}%")
+        print(f"\n  Effective Input Impedance at Max Power:")
+        print(f"    |Z_in| = {abs(load_pull_result.effective_z_in):.2f} Ω")
+        print(f"    ∠Z_in  = {np.angle(load_pull_result.effective_z_in, deg=True):.1f}°")
+        print(f"\n  (Note: This Z_in is EMPIRICALLY determined, not assumed!)")
+    else:
+        print("  Load-pull optimization failed. Using S-parameter results:")
+        print(f"  L  = {pi_opt_result.L*1e9:.4f} nH")
+        print(f"  C1 = {pi_opt_result.C1*1e12:.4f} pF")
+        print(f"  C2 = {pi_opt_result.C2*1e12:.4f} pF")
+    
+    # ===========================================================================
+    # 0d. FULL LOAD-PULL vs POWER (Key Nonlinear Characterization)
+    # ===========================================================================
+    print("\n" + "="*70)
+    print("METHOD 3: FULL LOAD-PULL vs INPUT POWER")
+    print("(Shows how optimal matching varies with input power - key result!)")
+    print("="*70)
+    print("\nThis analysis takes longer but reveals the nonlinear behavior.")
+    print("Running with reduced grid (5³ per power) for speed...")
+    
+    # Use fewer power levels and smaller grid for reasonable runtime
+    power_sweep_result = run_load_pull_vs_power(
+        n_points=5,  # 5³ = 125 sims per power level
+        p_dBm_list=[-30, -20, -15, -10, -5, 0],  # 6 power levels = 750 total sims
+        verbose=True
+    )
+    
+    print("\n" + "="*70)
+    print("COMPLETE ANALYSIS SUMMARY")
+    print("="*70)
+    print("\nGenerated plots in temp_image/:")
+    print("  - wifi_spectrum.png")
+    print("  - load_pull_optimization.png")
+    print("  - optimal_L_vs_power.png")
+    print("  - optimal_C_vs_power.png")
+    print("  - output_power_vs_input.png")
+    print("  - efficiency_vs_input.png")
+    print("  - halfwave_transient_waveforms.png")
+    print("  - matched_rectifier_comparison.png")
+    print("  - halfwave_sens_combined.png")
+    print("  - halfwave_freq_stability.png")
+    print("  - halfwave_mc_*.png")
+    
+    if power_sweep_result.success:
+        print("\n" + "="*70)
+        print("KEY RESULT: How Optimal Matching Varies with Input Power")
+        print("="*70)
+        print(power_sweep_result.summary())
