@@ -8,8 +8,23 @@ Modern optimization algorithms for component value optimization.
 Features:
     - Pi-match network optimization (L, C1, C2 values)
     - Multi-objective optimization (return loss, bandwidth, insertion loss)
+    - Load-pull optimization for maximum DC output power
+    - Load resistance sweep for optimal efficiency
     - Support for non-ideal component constraints
     - Multiple optimization backends (scipy, optuna)
+
+Efficiency Reference (from published research):
+    - Half-wave rectifier theoretical max: η = 4/π² ≈ 40.5%
+    - Full-wave rectifier theoretical max: η = 8/π² ≈ 81.0%
+    - Rectenna at 2.45 GHz (optimized): up to 90.6%
+    - Source: Wikipedia "Rectifier" and "Rectenna" articles, 
+              McSpadden et al. IEEE Trans. MTT 1998
+
+Key Functions:
+    - optimize_pi_match(): Optimize Pi-match for S-parameters
+    - optimize_pi_match_load_pull(): Maximize DC power output
+    - sweep_load_resistance(): Find optimal load for max efficiency
+    - plot_load_sweep(): Visualize efficiency vs load resistance
 
 Constraints:
     - Return loss < -20 dB (|S11| < 0.1)
@@ -78,6 +93,165 @@ class OptimizationResult:
             f"  Iterations: {self.n_iterations}, Evals: {self.n_function_evals}\n"
             f"  Message: {self.message}"
         )
+
+
+# =============================================================================
+# RF Rectifier Efficiency Theory (from published research)
+# =============================================================================
+# 
+# THEORETICAL EFFICIENCY LIMITS:
+# 
+# 1. Half-wave rectifier (ideal): η_max = 4/π² ≈ 40.5%
+#    - This is the conversion ratio of DC power to total AC power
+#    - Source: Wikipedia "Rectifier" - Quantification of rectifiers section
+#
+# 2. Full-wave rectifier (ideal): η_max = 8/π² ≈ 81.0%
+#
+# 3. RF Energy Harvesting Rectennas (practical at 2.45 GHz):
+#    - Record efficiency: 90.6% at 2.45 GHz (optimized rectenna design)
+#    - Typical achieved: 82% at 5.82 GHz
+#    - Source: Wikipedia "Rectenna", McSpadden et al. IEEE Trans. MTT 1998
+#
+# 4. Schottky diode characteristics affecting efficiency:
+#    - Forward voltage drop: ~0.3V (vs 0.7V for silicon p-n diodes)
+#    - At low RF power (<-10 dBm), diode turn-on losses dominate
+#    - Optimal load depends on input power and diode characteristics
+#
+# PRACTICAL CONSIDERATIONS:
+# - SMS7630 Schottky: Optimal load typically 500Ω-2kΩ at low power
+# - High load resistance (>5kΩ): Poor efficiency due to current limiting
+# - Low load resistance (<100Ω): Poor efficiency due to voltage loss
+# - Matching network losses reduce overall efficiency by 1-5%
+#
+# =============================================================================
+
+# Theoretical efficiency limits
+HALFWAVE_MAX_EFFICIENCY_PERCENT = 100 * (4 / np.pi**2)  # ~40.5%
+FULLWAVE_MAX_EFFICIENCY_PERCENT = 100 * (8 / np.pi**2)  # ~81.0%
+
+
+def validate_efficiency(efficiency_percent: float, 
+                        r_load: float,
+                        input_power_dBm: float,
+                        rectifier_type: str = "halfwave",
+                        verbose: bool = True) -> Dict:
+    """
+    Validate and diagnose RF rectifier efficiency results.
+    
+    This function helps understand if efficiency results are reasonable
+    and identifies potential issues.
+    
+    Args:
+        efficiency_percent: Measured/simulated efficiency (%)
+        r_load: Load resistance (Ohms)
+        input_power_dBm: Input power (dBm)
+        rectifier_type: "halfwave" or "fullwave"
+        verbose: Print diagnosis
+    
+    Returns:
+        Dict with diagnosis results
+    """
+    if rectifier_type.lower() == "halfwave":
+        theoretical_max = HALFWAVE_MAX_EFFICIENCY_PERCENT
+    else:
+        theoretical_max = FULLWAVE_MAX_EFFICIENCY_PERCENT
+    
+    ratio_to_theory = (efficiency_percent / theoretical_max) * 100
+    
+    diagnosis = {
+        'efficiency': efficiency_percent,
+        'theoretical_max': theoretical_max,
+        'ratio_to_theory_percent': ratio_to_theory,
+        'issues': [],
+        'recommendations': [],
+        'status': 'OK'
+    }
+    
+    # Check if efficiency exceeds theoretical max (simulation error)
+    if efficiency_percent > theoretical_max * 1.1:  # 10% tolerance
+        diagnosis['issues'].append(
+            f"Efficiency ({efficiency_percent:.1f}%) exceeds theoretical max ({theoretical_max:.1f}%)"
+        )
+        diagnosis['recommendations'].append(
+            "Check P_available formula: P_avail = V_peak² / (8 × R_source)"
+        )
+        diagnosis['status'] = 'ERROR'
+    
+    # Check load resistance issues
+    if r_load > 5000:
+        diagnosis['issues'].append(
+            f"High load resistance ({r_load:.0f}Ω) - may limit current"
+        )
+        diagnosis['recommendations'].append(
+            "Try lower R_load (500-2000Ω) for better efficiency with SMS7630"
+        )
+        if diagnosis['status'] == 'OK':
+            diagnosis['status'] = 'WARNING'
+    
+    if r_load < 200:
+        diagnosis['issues'].append(
+            f"Low load resistance ({r_load:.0f}Ω) - high voltage loss"
+        )
+        diagnosis['recommendations'].append(
+            "Try higher R_load (500-2000Ω) for SMS7630"
+        )
+        if diagnosis['status'] == 'OK':
+            diagnosis['status'] = 'WARNING'
+    
+    # Check input power issues
+    if input_power_dBm < -20:
+        diagnosis['issues'].append(
+            f"Very low input power ({input_power_dBm:.0f} dBm)"
+        )
+        diagnosis['recommendations'].append(
+            "At low power, diode turn-on loss dominates. Efficiency improves at higher power."
+        )
+        if diagnosis['status'] == 'OK':
+            diagnosis['status'] = 'INFO'
+    
+    # Assess efficiency level
+    if efficiency_percent < 5:
+        diagnosis['issues'].append("Very low efficiency (<5%)")
+        diagnosis['recommendations'].append(
+            "Check: 1) Load resistance, 2) Matching network, 3) Input power level"
+        )
+        if diagnosis['status'] == 'OK':
+            diagnosis['status'] = 'WARNING'
+    elif efficiency_percent < 15:
+        diagnosis['issues'].append("Low efficiency (5-15%)")
+        diagnosis['recommendations'].append(
+            "This may be acceptable for very low power. Consider load sweep optimization."
+        )
+        if diagnosis['status'] == 'OK':
+            diagnosis['status'] = 'INFO'
+    elif efficiency_percent > 25 and rectifier_type.lower() == "halfwave":
+        diagnosis['status'] = 'GOOD'
+        diagnosis['recommendations'].append(
+            f"Good efficiency! {ratio_to_theory:.0f}% of theoretical max."
+        )
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("EFFICIENCY DIAGNOSIS")
+        print("="*60)
+        print(f"  Measured efficiency:  {efficiency_percent:.2f}%")
+        print(f"  Theoretical max:      {theoretical_max:.1f}% ({rectifier_type})")
+        print(f"  Ratio to theory:      {ratio_to_theory:.1f}%")
+        print(f"  Status:               {diagnosis['status']}")
+        
+        if diagnosis['issues']:
+            print("\n  Issues detected:")
+            for issue in diagnosis['issues']:
+                print(f"    - {issue}")
+        
+        if diagnosis['recommendations']:
+            print("\n  Recommendations:")
+            for rec in diagnosis['recommendations']:
+                print(f"    → {rec}")
+        
+        print("="*60)
+    
+    return diagnosis
 
 
 # =============================================================================
@@ -922,7 +1096,7 @@ def estimate_effective_impedance(L_opt: float, C1_opt: float, C2_opt: float,
 def optimize_pi_match_load_pull(
     freq: float = 2.437e9,
     v_amp: float = 0.3,
-    r_load: float = 5000.0,
+    r_load: float = 1000.0,  # 1kΩ default (5kΩ was too high for good efficiency)
     c_in: float = 100e-12,
     c_out: float = 100e-12,
     ant_imp: float = 50.0,
@@ -1227,7 +1401,7 @@ def plot_load_pull_results(result: LoadPullResult,
 def optimize_pi_match_load_pull_vs_power(
     freq: float = 2.437e9,
     p_dBm_list: List[float] = None,
-    r_load: float = 5000.0,
+    r_load: float = 1000.0,  # 1kΩ default (5kΩ was too high for good efficiency)
     c_in: float = 100e-12,
     c_out: float = 100e-12,
     ant_imp: float = 50.0,
@@ -1501,6 +1675,279 @@ def plot_load_pull_vs_power(result: LoadPullSweepResult,
         plt.close('all')
     
     print(f"\n[INFO] All plots saved to '{save_dir}/'")
+
+
+# =============================================================================
+# Load Resistance Sweep: Find Optimal R_load for Maximum Efficiency
+# =============================================================================
+
+@dataclass
+class LoadSweepResult:
+    """Container for load resistance sweep results."""
+    success: bool
+    r_load_values: List[float]      # Load resistances swept (Ohms)
+    efficiency_values: List[float]   # Efficiency at each load (%)
+    power_out_values: List[float]    # Output power at each load (W)
+    v_dc_values: List[float]         # DC voltage at each load (V)
+    optimal_r_load: float            # Optimal load resistance (Ohms)
+    max_efficiency: float            # Maximum efficiency achieved (%)
+    power_at_optimal: float          # Power at optimal load (W)
+    input_power_dBm: float           # Input power used (dBm)
+    
+    def summary(self) -> str:
+        return (
+            f"\n{'='*60}\n"
+            f"LOAD SWEEP RESULTS\n"
+            f"{'='*60}\n"
+            f"  Input Power:      {self.input_power_dBm:.1f} dBm\n"
+            f"  R_load range:     {min(self.r_load_values):.0f} - {max(self.r_load_values):.0f} Ω\n"
+            f"  Optimal R_load:   {self.optimal_r_load:.0f} Ω\n"
+            f"  Max Efficiency:   {self.max_efficiency:.2f}%\n"
+            f"  P_out at optimal: {self.power_at_optimal*1e6:.2f} µW\n"
+            f"\n  THEORETICAL LIMIT (half-wave): {HALFWAVE_MAX_EFFICIENCY_PERCENT:.1f}%\n"
+            f"  Achieved/Theory:  {100*self.max_efficiency/HALFWAVE_MAX_EFFICIENCY_PERCENT:.1f}%\n"
+            f"{'='*60}"
+        )
+
+
+def sweep_load_resistance(
+    freq: float = 2.437e9,
+    v_amp: float = 0.3,
+    c_in: float = 100e-12,
+    c_out: float = 100e-12,
+    ant_imp: float = 50.0,
+    q_L: float = 50.0,
+    q_C: float = 100.0,
+    cap_q: float = 30.0,
+    n_cycles: int = 100,
+    diode_model_name: str = "SMS7630",
+    diode_model_file: str = "diode_models.lib",
+    r_load_min: float = 100.0,
+    r_load_max: float = 10000.0,
+    n_loads: int = 20,
+    use_pi_match: bool = True,
+    L_val: float = None,
+    C1_val: float = None,
+    C2_val: float = None,
+    verbose: bool = True
+) -> LoadSweepResult:
+    """
+    Sweep load resistance to find optimal R_load for maximum efficiency.
+    
+    This is critical because RF rectifier efficiency strongly depends on
+    load impedance matching. The optimal load typically ranges from 500Ω
+    to 2kΩ for SMS7630 at low power levels.
+    
+    Reference: For half-wave rectifier, theoretical max is η = 4/π² ≈ 40.5%
+    
+    Args:
+        freq: Operating frequency (Hz)
+        v_amp: RF input amplitude (V)
+        c_in, c_out: Coupling/filter capacitors (F)
+        ant_imp: Source/antenna impedance (Ohms)
+        q_L, q_C, cap_q: Component Q factors
+        n_cycles: Simulation cycles for steady state
+        diode_model_name: SPICE diode model name
+        diode_model_file: Model file path
+        r_load_min: Minimum load resistance to sweep (Ohms)
+        r_load_max: Maximum load resistance to sweep (Ohms)
+        n_loads: Number of load values to test
+        use_pi_match: If True, use Pi-match network
+        L_val, C1_val, C2_val: Pi-match values (if None, use default design)
+        verbose: Print progress
+    
+    Returns:
+        LoadSweepResult with optimal R_load and efficiency data
+    """
+    from pathlib import Path
+    
+    if verbose:
+        print("\n" + "="*60)
+        print("LOAD RESISTANCE SWEEP: Find Optimal R_load")
+        print("="*60)
+        p_in_dBm = vpeak_to_dBm(v_amp, ant_imp)
+        print(f"  Frequency:    {freq/1e9:.3f} GHz")
+        print(f"  Input power:  {p_in_dBm:.1f} dBm ({v_amp*1000:.1f} mV)")
+        print(f"  R_load range: {r_load_min:.0f} - {r_load_max:.0f} Ω ({n_loads} points)")
+        print(f"  Pi-match:     {'Yes' if use_pi_match else 'No (direct)'}")
+        print(f"\n  Theoretical max efficiency (half-wave): {HALFWAVE_MAX_EFFICIENCY_PERCENT:.1f}%")
+        print("-"*60)
+    
+    # Get model path
+    script_dir = Path(__file__).parent.absolute()
+    model_path = script_dir / diode_model_file
+    
+    # Use logarithmic spacing for load resistance (better coverage)
+    r_load_values = np.logspace(np.log10(r_load_min), np.log10(r_load_max), n_loads)
+    
+    # Get Pi-match values if not provided
+    if use_pi_match and (L_val is None or C1_val is None or C2_val is None):
+        # Use default design values
+        init_pi = design_pi_match(ant_imp, ant_imp, freq, q_L, q_C)
+        L_val = init_pi.L.L
+        C1_val = init_pi.C1.C
+        C2_val = init_pi.C2.C
+        if verbose:
+            print(f"  Using default Pi-match: L={L_val*1e9:.2f}nH, C1={C1_val*1e12:.2f}pF, C2={C2_val*1e12:.2f}pF")
+            print("-"*60)
+    
+    efficiency_values = []
+    power_out_values = []
+    v_dc_values = []
+    
+    for i, r_load in enumerate(r_load_values):
+        if use_pi_match:
+            result = _run_single_load_pull_sim(
+                L_val, C1_val, C2_val,
+                freq, v_amp, c_in, c_out, r_load,
+                n_cycles, ant_imp, q_L, q_C, cap_q,
+                diode_model_name, model_path
+            )
+        else:
+            # Direct connection (no Pi-match) - need to build different netlist
+            # For simplicity, use Pi-match with very large L (bypass)
+            # or implement direct netlist builder
+            result = _run_single_load_pull_sim(
+                1e-12, 1e-6, 1e-6,  # Near-bypass Pi-match
+                freq, v_amp, c_in, c_out, r_load,
+                n_cycles, ant_imp, q_L, q_C, cap_q,
+                diode_model_name, model_path
+            )
+        
+        if result['success']:
+            efficiency_values.append(result['efficiency'])
+            power_out_values.append(result['p_out'])
+            v_dc_values.append(result['v_dc'])
+        else:
+            efficiency_values.append(0)
+            power_out_values.append(0)
+            v_dc_values.append(0)
+        
+        if verbose and (i+1) % 5 == 0:
+            print(f"  Progress: {i+1}/{n_loads}, R={r_load:.0f}Ω, η={result['efficiency']:.2f}%")
+    
+    # Find optimal
+    efficiency_arr = np.array(efficiency_values)
+    idx_best = np.argmax(efficiency_arr)
+    optimal_r_load = r_load_values[idx_best]
+    max_efficiency = efficiency_arr[idx_best]
+    power_at_optimal = power_out_values[idx_best]
+    
+    result = LoadSweepResult(
+        success=max_efficiency > 0,
+        r_load_values=list(r_load_values),
+        efficiency_values=efficiency_values,
+        power_out_values=power_out_values,
+        v_dc_values=v_dc_values,
+        optimal_r_load=optimal_r_load,
+        max_efficiency=max_efficiency,
+        power_at_optimal=power_at_optimal,
+        input_power_dBm=vpeak_to_dBm(v_amp, ant_imp)
+    )
+    
+    if verbose:
+        print(result.summary())
+    
+    return result
+
+
+def plot_load_sweep(result: LoadSweepResult,
+                    save_dir: str = "temp_image",
+                    show: bool = True):
+    """
+    Plot load resistance sweep results.
+    
+    Creates:
+      - efficiency_vs_rload.png: Efficiency vs load resistance
+      - power_and_voltage_vs_rload.png: Output power and voltage vs R_load
+    """
+    import matplotlib.pyplot as plt
+    from pathlib import Path
+    
+    try:
+        from utility import apply_pub_style
+        apply_pub_style()
+    except ImportError:
+        pass
+    
+    save_path = Path(save_dir)
+    save_path.mkdir(parents=True, exist_ok=True)
+    
+    r_load = np.array(result.r_load_values)
+    eff = np.array(result.efficiency_values)
+    p_out = np.array(result.power_out_values) * 1e6  # µW
+    v_dc = np.array(result.v_dc_values) * 1000  # mV
+    
+    # ===== Plot 1: Efficiency vs R_load =====
+    fig1, ax1 = plt.subplots(figsize=(10, 8))
+    ax1.semilogx(r_load, eff, 'k-', lw=2.5, marker='o', ms=8, 
+                  mfc='white', mew=2)
+    ax1.axhline(HALFWAVE_MAX_EFFICIENCY_PERCENT, color='r', ls='--', lw=2,
+                 label=f'Theoretical max: {HALFWAVE_MAX_EFFICIENCY_PERCENT:.1f}%')
+    ax1.axvline(result.optimal_r_load, color='g', ls=':', lw=2,
+                 label=f'Optimal: {result.optimal_r_load:.0f}Ω')
+    ax1.scatter([result.optimal_r_load], [result.max_efficiency], 
+                marker='*', s=300, c='lime', edgecolors='black', 
+                linewidths=2, zorder=10)
+    ax1.set_xlabel('Load Resistance R_load (Ω)')
+    ax1.set_ylabel('Power Conversion Efficiency (%)')
+    ax1.legend(loc='best')
+    ax1.grid(True, which='both', alpha=0.3, linestyle='--')
+    ax1.set_ylim(bottom=0)
+    for spine in ax1.spines.values():
+        spine.set_linewidth(2)
+    
+    # Add annotation
+    ax1.annotate(f'Max η = {result.max_efficiency:.1f}%\nat R = {result.optimal_r_load:.0f}Ω',
+                 xy=(result.optimal_r_load, result.max_efficiency),
+                 xytext=(result.optimal_r_load*3, result.max_efficiency*0.8),
+                 fontsize=14, 
+                 arrowprops=dict(arrowstyle='->', color='black'),
+                 bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    fig1.savefig(save_path / 'efficiency_vs_rload.png', dpi=300, 
+                 bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved: {save_path / 'efficiency_vs_rload.png'}")
+    
+    # ===== Plot 2: Power and Voltage vs R_load =====
+    fig2, ax2 = plt.subplots(figsize=(10, 8))
+    ax2_twin = ax2.twinx()
+    
+    line1, = ax2.semilogx(r_load, p_out, 'b-', lw=2.5, marker='s', ms=8, 
+                           mfc='white', mew=2, label='P_out')
+    ax2.set_xlabel('Load Resistance R_load (Ω)')
+    ax2.set_ylabel('DC Output Power (µW)', color='b')
+    ax2.tick_params(axis='y', labelcolor='b')
+    
+    line2, = ax2_twin.semilogx(r_load, v_dc, 'r--', lw=2.5, marker='^', ms=8, 
+                                mfc='white', mew=2, label='V_DC')
+    ax2_twin.set_ylabel('DC Output Voltage (mV)', color='r')
+    ax2_twin.tick_params(axis='y', labelcolor='r')
+    
+    ax2.axvline(result.optimal_r_load, color='g', ls=':', lw=2, 
+                 label=f'Optimal: {result.optimal_r_load:.0f}Ω')
+    
+    ax2.grid(True, which='both', alpha=0.3, linestyle='--')
+    for spine in ax2.spines.values():
+        spine.set_linewidth(2)
+    
+    # Combined legend
+    lines = [line1, line2]
+    labels = [l.get_label() for l in lines]
+    ax2.legend(lines, labels, loc='upper right')
+    
+    plt.tight_layout()
+    fig2.savefig(save_path / 'power_and_voltage_vs_rload.png', dpi=300, 
+                 bbox_inches='tight', facecolor='white')
+    print(f"[INFO] Saved: {save_path / 'power_and_voltage_vs_rload.png'}")
+    
+    if show:
+        plt.show()
+    else:
+        plt.close('all')
+    
+    print(f"\n[INFO] Load sweep plots saved to '{save_dir}/'")
 
 
 # =============================================================================

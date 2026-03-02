@@ -78,7 +78,7 @@ R_SOURCE = ANT_IMP
 
 C_IN = 100e-12          # 100 pF input coupling
 C_OUT = 100e-12         # 100 pF output smoothing
-R_LOAD = 5e3            # 5 kOhm load (fixed for sensitivity analysis)
+R_LOAD = 1e3            # 1 kOhm load - lower R gives better efficiency (5kΩ was too high)
 
 # Quality factors for non-ideal components
 CAP_Q = 30              # Capacitor Q (realistic for commercial RF caps at GHz)

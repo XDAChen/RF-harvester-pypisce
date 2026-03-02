@@ -49,6 +49,18 @@ from optimization import optimize_pi_match, OptimizationResult
 # =============================================================================
 # Circuit Parameters - 2.437 GHz RF Energy Harvesting (WiFi Channel 6)
 # =============================================================================
+#
+# EFFICIENCY REFERENCE (from published research):
+#   - Half-wave rectifier theoretical max: η = 4/π² ≈ 40.5%
+#   - Full-wave rectifier theoretical max: η = 8/π² ≈ 81.0%
+#   - Rectenna at 2.45 GHz (optimized): up to 90.6%
+#   - SMS7630 practical efficiency: 20-40% depending on power level and load
+#
+# CRITICAL: Optimal load resistance is typically 500Ω-2kΩ for SMS7630.
+#           High load (>5kΩ) results in poor efficiency due to current limiting.
+#           See sweep_load_resistance() in optimization.py to find optimal R_load.
+#
+# =============================================================================
 
 F_RF = 2.437e9          # 2.437 GHz - WiFi Channel 6 center frequency
 T_RF = 1 / F_RF
@@ -66,7 +78,9 @@ R_SOURCE = ANT_IMP
 
 C_IN = 100e-12          # 100 pF input coupling
 C_OUT = 100e-12         # 100 pF output smoothing
-R_LOAD = 5e3            # 5 kOhm load (fixed for sensitivity analysis)
+# NOTE: R_LOAD = 1kΩ is near-optimal for SMS7630 at low power (~-10 to 0 dBm)
+# For efficiency optimization, use sweep_load_resistance() to find best value
+R_LOAD = 1e3            # 1 kOhm load (optimized - was 5kΩ which gave poor efficiency)
 
 # Quality factors for non-ideal components
 CAP_Q = 30              # Capacitor Q (realistic for commercial RF caps at GHz)
